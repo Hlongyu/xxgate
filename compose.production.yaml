@@ -1,0 +1,66 @@
+name: xxgate
+services:
+  xxgate:
+    image: local/xxgate:${XXGATE_IMAGE_TAG:-latest}
+    container_name: xxgate
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://xxgate:${XXGATE_DB_PASSWORD:?required}@xxgate-db:5432/xxgate
+      XXGATE_MASTER_KEY: ${XXGATE_MASTER_KEY:?required}
+      XXGATE_ADMIN_PASSWORD: ${XXGATE_ADMIN_PASSWORD:?required}
+      XXGATE_BIND: 0.0.0.0:8787
+      XXGATE_SECURE_COOKIES: "1"
+      RUST_LOG: xxgate=info,xxgate_server=info,xxgate_core=info
+    ports:
+      - "127.0.0.1:${XXGATE_HOST_PORT:-8797}:8787"
+    networks:
+      private:
+      sub2api:
+        aliases: [xxgate]
+    depends_on:
+      xxgate-db:
+        condition: service_healthy
+    mem_limit: 1g
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+  xxgate-db:
+    image: postgres:15-alpine
+    container_name: xxgate-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: xxgate
+      POSTGRES_PASSWORD: ${XXGATE_DB_PASSWORD:?required}
+      POSTGRES_DB: xxgate
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [private]
+    mem_limit: 512m
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U xxgate -d xxgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+networks:
+  private:
+    name: xxgate-private
+    internal: true
+  sub2api:
+    external: true
+    name: ${XXGATE_SUB2API_NETWORK:-code-internal}
+volumes:
+  postgres_data:

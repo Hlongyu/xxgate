@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: xxgate
+      POSTGRES_PASSWORD: ${XXGATE_DB_PASSWORD:-xxgate-local-development}
+      POSTGRES_DB: xxgate
+    ports:
+      - "127.0.0.1:${XXGATE_DB_PORT:-55439}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xxgate -d xxgate"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+volumes:
+  postgres_data:

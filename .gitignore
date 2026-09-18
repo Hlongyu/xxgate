@@ -1,0 +1,25 @@
+/target/
+/.local/
+/web/node_modules/
+/web/dist/
+/web/test-results/
+/artifacts/
+/.env
+*.log
+.DS_Store
+/.xxgate/
+
+# Credentials and local deployment artifacts must never enter the repository.
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+*.pem
+*.key
+/backups/
+*.dump
+*.sql.gz
+*.tar
+*.tar.gz
+*.tar.zst
