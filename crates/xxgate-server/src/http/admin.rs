@@ -31,6 +31,46 @@ pub async fn dashboard(
     result["runtime"] = json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used(),"config_version":s.gateway.settings.current().version});
     Ok(Json(result))
 }
+// Read identity metadata without refreshing tokens or making upstream requests.
+async fn account_email(s: &AppState, id: Uuid) -> xxgate_core::Result<Option<String>> {
+    let credentials = s
+        .gateway
+        .cipher
+        .decrypt(id, &s.gateway.store.credentials(id).await?)?;
+    Ok(xxgate_codex::provider::oauth::account_details(&credentials)
+        .ok()
+        .and_then(|d| d.email))
+}
+
+pub async fn delete_account(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let _lock = s.gateway.mutations.lock().await;
+    let previous = s
+        .gateway
+        .scheduler
+        .account(id)
+        .ok_or_else(Error::not_found)?;
+    s.gateway.scheduler.block_account(id);
+    if let Err(error) = s.gateway.store.delete_account(id).await {
+        s.gateway.scheduler.update_account(previous);
+        return Err(error.into());
+    }
+    s.gateway.scheduler.remove_account(id);
+    Ok(Json(json!({"deleted":true})))
+}
+pub async fn delete_key(State(s): State<AppState>, Path(id): Path<Uuid>) -> ApiResult<Json<Value>> {
+    let _lock = s.gateway.mutations.lock().await;
+    s.gateway.scheduler.block_key(id);
+    if let Err(error) = s.gateway.store.delete_key(id).await {
+        reconcile_keys(&s).await;
+        return Err(error.into());
+    }
+    s.gateway.scheduler.remove_key(id);
+    Ok(Json(json!({"deleted":true})))
+}
+
 pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let mut items = Vec::new();
     let now = Utc::now();
@@ -54,7 +94,8 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
             .account_spending(account.id, now, stale)
             .await?;
         let resets = super::resets::view(&s, account.id).await?;
-        items.push(json!({"account":account,"quotas":windows,"spending":spending,"resets":resets}));
+        let email = account_email(&s, account.id).await?;
+        items.push(json!({"email":email,"account":account,"quotas":windows,"spending":spending,"resets":resets}));
     }
     Ok(Json(
         json!({"items":items,"runtime":s.gateway.scheduler.stats()}),
@@ -70,7 +111,7 @@ pub async fn account_detail(
         .account(id)
         .ok_or_else(Error::not_found)?;
     Ok(Json(
-        json!({"account":a,"quotas":s.gateway.store.quotas(id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
+        json!({"email":account_email(&s,id).await?,"account":a,"quotas":s.gateway.store.quotas(id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
     ))
 }
 #[derive(Deserialize)]

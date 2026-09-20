@@ -3,7 +3,11 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use uuid::Uuid;
-use xxgate_core::{Error, Result, quota::QuotaWindow, reports::weekly_quota_sample};
+use xxgate_core::{
+    Error, Result,
+    quota::QuotaWindow,
+    reports::{quota_cycle, weekly_quota_sample},
+};
 
 #[derive(sqlx::FromRow)]
 struct SpendingTotal {
@@ -11,6 +15,9 @@ struct SpendingTotal {
     cny: String,
     requests: i64,
     unpriced: i64,
+    input_tokens: Option<String>,
+    output_tokens: Option<String>,
+    missing_tokens: i64,
 }
 
 impl PgStore {
@@ -20,18 +27,22 @@ impl PgStore {
         now: DateTime<Utc>,
         stale_seconds: u64,
     ) -> Result<Value> {
-        let rows=sqlx::query("SELECT data FROM quota_snapshots WHERE account_id=$1 AND pool='codex' AND window_minutes=10080 AND observed_at>$2-interval '7 days' AND observed_at<=$2 ORDER BY observed_at DESC,id DESC LIMIT 10000")
+        let rows=sqlx::query("SELECT data FROM quota_snapshots WHERE account_id=$1 AND pool='codex' AND window_minutes IN (300,10080) AND observed_at>=$2-interval '7 days' AND observed_at<=$2 ORDER BY observed_at,id")
             .bind(id).bind(now).fetch_all(&self.pool).await.map_err(|_|Error::storage())?;
         let windows = rows
             .iter()
             .map(decode::<QuotaWindow>)
             .collect::<Result<Vec<_>>>()?;
         let sample = weekly_quota_sample(&windows, now);
+        let short = quota_cycle(&windows, 300, now);
+        let week = quota_cycle(&windows, 10080, now);
         let totals = sqlx::query_as::<_, SpendingTotal>(include_str!("account_spending.sql"))
             .bind(id)
             .bind(now)
             .bind(sample.map(|(first, _)| first.observed_at))
             .bind(sample.map(|(_, last)| last.observed_at))
+            .bind(short.as_ref().map(|c| c.starts_at))
+            .bind(week.as_ref().map(|c| c.starts_at))
             .fetch_all(&self.pool)
             .await
             .map_err(|_| Error::storage())?;
@@ -43,7 +54,14 @@ impl PgStore {
         };
         let period = |label: &str, hours: i32| -> Result<Value> {
             let t = total(label)?;
-            Ok(json!({"hours":hours,"cny":t.cny,"requests":t.requests,"unpriced":t.unpriced}))
+            let cycle = if hours == 5 {
+                short.as_ref()
+            } else {
+                week.as_ref()
+            };
+            Ok(
+                json!({"hours":hours,"status":if cycle.is_some() {"current_cycle"} else {"unknown_cycle"},"starts_at":cycle.map(|c|c.starts_at),"resets_at":cycle.and_then(|c|c.latest.resets_at),"cny":cycle.map(|_|&t.cny),"requests":cycle.map(|_|t.requests),"input_tokens":cycle.and(t.input_tokens.as_ref()),"output_tokens":cycle.and(t.output_tokens.as_ref()),"missing_tokens":t.missing_tokens,"unpriced":t.unpriced}),
+            )
         };
         let mut estimate = json!({"status":"insufficient_sample","total_cny":null});
         if let Some((first, last)) = sample {

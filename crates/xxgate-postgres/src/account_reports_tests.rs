@@ -53,7 +53,7 @@ fn record(account: Option<Uuid>, at: DateTime<Utc>, cny: Option<&str>) -> Reques
         "id":Uuid::new_v4(),"key_id":Uuid::new_v4(),"account_id":account,
         "client_session_id":"test","client_thread_id":"test","model":"m","provider":"openai",
         "state":"completed","created_at":at-Duration::minutes(1),"finished_at":at,
-        "usage":xxgate_core::usage::Usage { complete:true, ..Default::default() },
+        "usage":xxgate_core::usage::Usage { complete:true, input_tokens:Some(1234), output_tokens:Some(56), ..Default::default() },
         "valuation":{"status":"priced","price_version":null,"cny":cny,"items":[]},
         "config_version":1,"config_versions":[1],"body_bytes":0,"upstream_attempts":1
     }))
@@ -84,6 +84,8 @@ async fn compare_windows(
         .bind(now)
         .bind(from)
         .bind(to)
+        .bind(now - Duration::hours(5))
+        .bind(now - Duration::days(7))
         .fetch_all(&store.pool)
         .await
         .unwrap();
@@ -96,7 +98,7 @@ async fn compare_windows(
         };
         // The pre-migration query is the oracle, including its exact bounds,
         // frozen valuation, upstream-model fallback and Spark exclusion.
-        let old = sqlx::query("SELECT COALESCE(sum((data->'valuation'->>'cny')::numeric),0)::text AS cny, count(*) AS requests, count(*) FILTER(WHERE data->'valuation'->>'cny' IS NULL) AS unpriced FROM requests WHERE account_id=$1 AND finished_at>$2 AND finished_at<=$3 AND (NOT $4 OR ((data->>'upstream_attempts')::bigint>0 AND COALESCE(data->>'upstream_model',model)<>'gpt-5.3-codex-spark'))")
+        let old = sqlx::query("SELECT COALESCE(sum((data->'valuation'->>'cny')::numeric),0)::text AS cny, count(*) AS requests, count(*) FILTER(WHERE data->'valuation'->>'cny' IS NULL) AS unpriced, sum((data->'usage'->>'input_tokens')::numeric)::text AS input_tokens, sum((data->'usage'->>'output_tokens')::numeric)::text AS output_tokens FROM requests WHERE account_id=$1 AND finished_at>$2 AND finished_at<=$3 AND (NOT $4 OR ((data->>'upstream_attempts')::bigint>0 AND COALESCE(data->>'upstream_model',model)<>'gpt-5.3-codex-spark'))")
             .bind(account).bind(start).bind(end).bind(main).fetch_one(&store.pool).await.unwrap();
         assert_eq!(
             t.cny.parse::<Decimal>().unwrap(),
@@ -104,6 +106,19 @@ async fn compare_windows(
             "{} {start} {end}",
             t.label
         );
+        if !main {
+            for (actual, column) in [
+                (&t.input_tokens, "input_tokens"),
+                (&t.output_tokens, "output_tokens"),
+            ] {
+                let expected = if t.requests == 0 {
+                    Some("0".to_owned())
+                } else {
+                    old.get::<Option<String>, _>(column)
+                };
+                assert_eq!(*actual, expected, "{} {column}", t.label);
+            }
+        }
         assert_eq!(
             t.requests,
             old.get::<i64, _>("requests"),
@@ -181,6 +196,16 @@ async fn account_rollups_backfill_and_increment_match_exact_windows() {
         insert_historical(&store, r).await;
     }
     sqlx::raw_sql(MIGRATION).execute(&store.pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0011_account_cycle_tokens.sql"))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0012_soft_delete_accounts_keys.sql"
+    ))
+    .execute(&store.pool)
+    .await
+    .unwrap();
     // Replaying a previously finalized row cannot charge the backfill twice.
     store.finish_request(&records[0]).await.unwrap();
     for r in &records[100..] {
@@ -280,6 +305,13 @@ async fn account_rollups_are_atomic_idempotent_and_survive_detail_cleanup() {
         &record(Some(id), now - Duration::days(9), Some("40")),
     )
     .await;
+    sqlx::raw_sql("ALTER TABLE quota_snapshots DROP CONSTRAINT quota_snapshots_account_id_fkey")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    for (at, used) in [(now - Duration::days(3), 10.0), (now, 20.0)] {
+        save_window(&store, id, 10080, at, now + Duration::days(4), used).await;
+    }
     let before = store.spending_report(id, now, 900).await.unwrap();
     assert_eq!(before["last_7d"]["cny"], "22");
     assert_eq!(before["last_7d"]["requests"], 13);
@@ -351,7 +383,7 @@ async fn account_period_amounts_and_weekly_estimate_use_matching_samples() {
     }
     for (minutes, percent, resets_at) in [
         (120, 20.0, reset),
-        (90, 100.0, reset - Duration::days(1)),
+        (180, 100.0, reset - Duration::days(1)),
         (0, 30.0, reset),
     ] {
         let w = QuotaWindow {
@@ -365,9 +397,10 @@ async fn account_period_amounts_and_weekly_estimate_use_matching_samples() {
         sqlx::query("INSERT INTO quota_snapshots(account_id,pool,window_minutes,observed_at,data) VALUES($1,'codex',10080,$2,$3)")
             .bind(id).bind(w.observed_at).bind(json!(w)).execute(&store.pool).await.unwrap();
     }
+    save_window(&store, id, 300, now, now + Duration::hours(2), 30.0).await;
     let report = store.spending_report(id, now, 900).await.unwrap();
     assert_eq!(report["last_5h"]["cny"], "17");
-    assert_eq!(report["last_7d"]["cny"], "40");
+    assert_eq!(report["last_7d"]["cny"], "17");
     assert_eq!(report["last_5h"]["unpriced"], 1);
     let estimate = &report["weekly_estimate"];
     assert_eq!(estimate["sample_cny"], "10");
@@ -392,5 +425,127 @@ async fn account_period_amounts_and_weekly_estimate_use_matching_samples() {
             .unwrap()["weekly_estimate"]["sample_stale"],
         true
     );
+    teardown(store, schema).await;
+}
+
+async fn save_window(
+    store: &PgStore,
+    id: Uuid,
+    minutes: i32,
+    at: DateTime<Utc>,
+    reset: DateTime<Utc>,
+    used: f64,
+) {
+    let w = QuotaWindow {
+        pool: "codex".into(),
+        window_minutes: Some(i64::from(minutes)),
+        used_percent: used,
+        resets_at: Some(reset),
+        observed_at: at,
+        source: "test".into(),
+    };
+    sqlx::query("INSERT INTO quota_snapshots(account_id,pool,window_minutes,observed_at,data) VALUES($1,'codex',$2,$3,$4)")
+        .bind(id).bind(minutes).bind(at).bind(json!(w)).execute(&store.pool).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database; run python3 scripts/test.py"]
+async fn account_cycles_survive_dense_sampling_and_reset_independently() {
+    let (store, schema) = setup(true).await;
+    sqlx::raw_sql("ALTER TABLE quota_snapshots DROP CONSTRAINT quota_snapshots_account_id_fkey")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    let now = Utc::now().with_nanosecond(0).unwrap();
+    let reset = now + Duration::days(2);
+    save_window(&store, id, 10080, now - Duration::days(4), reset, 10.0).await;
+    finish(
+        &store,
+        &record(Some(id), now - Duration::days(3), Some("20")),
+    )
+    .await;
+    finish(
+        &store,
+        &record(Some(id), now - Duration::hours(4), Some("7")),
+    )
+    .await;
+    finish(
+        &store,
+        &record(Some(id), now - Duration::minutes(10), Some("3")),
+    )
+    .await;
+    let w = QuotaWindow {
+        pool: "codex".into(),
+        window_minutes: Some(10080),
+        used_percent: 30.0,
+        resets_at: Some(reset),
+        observed_at: now,
+        source: "test".into(),
+    };
+    // Header observations can exceed 10,000 long before the current week ends.
+    sqlx::query("INSERT INTO quota_snapshots(account_id,pool,window_minutes,observed_at,data) SELECT $1,'codex',10080,$2,$3 FROM generate_series(1,10001)")
+        .bind(id).bind(now).bind(json!(w)).execute(&store.pool).await.unwrap();
+    save_window(
+        &store,
+        id,
+        300,
+        now - Duration::hours(2),
+        now + Duration::hours(1),
+        90.0,
+    )
+    .await;
+    save_window(
+        &store,
+        id,
+        300,
+        now - Duration::minutes(30),
+        now + Duration::hours(1),
+        0.0,
+    )
+    .await;
+    save_window(&store, id, 300, now, now + Duration::hours(1), 10.0).await;
+    let report = store.spending_report(id, now, 900).await.unwrap();
+    assert_eq!(report["last_5h"]["cny"], "3");
+    assert_eq!(report["last_5h"]["requests"], 1);
+    assert_eq!(report["last_5h"]["input_tokens"], "1234");
+    assert_eq!(report["last_5h"]["output_tokens"], "56");
+    assert_eq!(report["last_7d"]["requests"], 3);
+    assert_eq!(report["last_7d"]["input_tokens"], "3702");
+    assert_eq!(report["last_7d"]["output_tokens"], "168");
+    assert_eq!(report["last_7d"]["cny"], "30");
+    assert_eq!(report["weekly_estimate"]["sample_cny"], "30");
+    assert_eq!(report["weekly_estimate"]["used_percent_delta"], 20.0);
+    let later = store
+        .spending_report(id, now + Duration::minutes(20), 900)
+        .await
+        .unwrap();
+    assert_eq!(report["last_7d"], later["last_7d"]);
+    assert_eq!(
+        report["weekly_estimate"]["sample_from"],
+        later["weekly_estimate"]["sample_from"]
+    );
+    store
+        .cleanup(&RuntimeSettings {
+            request_retention_days: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(report, store.spending_report(id, now, 900).await.unwrap());
+    // Missing/expired periods are unknown, not rolling spend disguised as zero.
+    let expired = store.spending_report(id, reset, 900).await.unwrap();
+    assert_eq!(expired["last_7d"]["cny"], Value::Null);
+    assert_eq!(expired["weekly_estimate"]["total_cny"], Value::Null);
+    let mut partial = record(Some(id), now - Duration::minutes(5), Some("1"));
+    partial.usage.input_tokens = None;
+    partial.usage.output_tokens = Some(7);
+    finish(&store, &partial).await;
+    store.finish_request(&partial).await.unwrap();
+    let partial_report = store.spending_report(id, now, 900).await.unwrap();
+    assert_eq!(partial_report["last_5h"]["requests"], 2);
+    assert_eq!(partial_report["last_5h"]["input_tokens"], "1234");
+    assert_eq!(partial_report["last_5h"]["output_tokens"], "63");
+    assert_eq!(partial_report["last_5h"]["missing_tokens"], 1);
     teardown(store, schema).await;
 }

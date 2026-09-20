@@ -57,6 +57,8 @@ impl RequestStore for PgStore {
                     r.upstream_attempts > 0
                         && r.upstream_model.as_deref().unwrap_or(&r.model) != "gpt-5.3-codex-spark",
                 )
+                .bind(r.usage.input_tokens.map(Decimal::from))
+                .bind(r.usage.output_tokens.map(Decimal::from))
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| Error::storage())?;
@@ -299,7 +301,7 @@ impl ReportStore for PgStore {
     }
     async fn cleanup(&self, cfg: &RuntimeSettings) -> Result<Value> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
-        // Preserve rolling seven-day statistics even when request details have
+        // Preserve current quota-cycle statistics even when request details have
         // a shorter retention. Delete only complete hours from both tables.
         sqlx::query("DELETE FROM account_spending_entries WHERE finished_at < date_trunc('hour',now()-interval '8 days','UTC')")
             .execute(&mut *tx).await.map_err(|_|Error::storage())?;
@@ -311,7 +313,7 @@ impl ReportStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| Error::storage())?;
-        sqlx::query("DELETE FROM quota_snapshots WHERE observed_at<now()-make_interval(days=>$1) AND id NOT IN (SELECT max(id) FROM quota_snapshots GROUP BY account_id,pool,window_minutes)").bind(cfg.request_retention_days as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?;
+        sqlx::query("DELETE FROM quota_snapshots WHERE observed_at<now()-make_interval(days=>$1) AND id NOT IN (SELECT max(id) FROM quota_snapshots GROUP BY account_id,pool,window_minutes)").bind(cfg.request_retention_days.max(8) as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(
             json!({"config_version":cfg.version,"requests_deleted":requests,"events_deleted":events,"finished_at":Utc::now()}),

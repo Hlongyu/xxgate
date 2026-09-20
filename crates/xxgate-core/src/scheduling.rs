@@ -28,6 +28,8 @@ struct Inner {
 }
 #[derive(Default)]
 struct State {
+    deleted_accounts: HashSet<Uuid>,
+    deleted_keys: HashSet<Uuid>,
     accounts: HashMap<Uuid, Account>,
     keys: HashMap<Uuid, GatewayKey>,
     blocked_keys: HashSet<Uuid>,
@@ -216,6 +218,9 @@ impl Scheduler {
     }
     pub fn update_account(&self, account: Account) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.deleted_accounts.contains(&account.id) {
+            return;
+        }
         state.blocked.remove(&account.id);
         state.accounts.insert(account.id, account);
         drop(state);
@@ -223,8 +228,25 @@ impl Scheduler {
     }
     pub fn update_key(&self, key: GatewayKey) {
         let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.deleted_keys.contains(&key.id) {
+            return;
+        }
         s.blocked_keys.remove(&key.id);
         s.keys.insert(key.id, key);
+        drop(s);
+        self.wake();
+    }
+    pub fn remove_account(&self, id: Uuid) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.deleted_accounts.insert(id);
+        s.accounts.remove(&id);
+        drop(s);
+        self.wake();
+    }
+    pub fn remove_key(&self, id: Uuid) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.deleted_keys.insert(id);
+        s.keys.remove(&id);
         drop(s);
         self.wake();
     }

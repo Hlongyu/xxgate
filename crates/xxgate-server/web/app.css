@@ -166,3 +166,44 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
 @media(max-width:900px){.error-filter-main label{flex:1;min-width:150px}.error-filter-main input,.error-filter-main select{width:100%}.error-metrics .error-last-seen{font-size:15px}.error-selection{align-items:flex-start;flex-direction:column}}
 @media(max-width:520px){.error-filter-main label,.error-filter-main .error-search{min-width:0;flex-basis:calc(50% - 6px)}.error-filter-main .error-search{flex-basis:100%}.error-custom-range label{width:100%}.error-custom-range input{width:100%}.error-chart{margin:0 16px}.error-trend .chart-labels{padding:10px 16px 16px;gap:12px}.error-trend .panel-head{align-items:flex-start;gap:12px}.error-trend .panel-head>span{font-size:11px;white-space:nowrap}}
 .error-requests td{padding:14px 16px}.error-requests td .small{display:inline-flex;align-items:center;gap:4px;margin-top:4px}.error-requests .panel-head{flex-wrap:wrap;gap:8px}.error-requests .panel-head h2{white-space:nowrap;flex-shrink:0}
+
+/* Compact account rows keep identity, cycle expiry and cycle spend in view. */
+.account-list{gap:10px}
+.account-row{display:grid;grid-template-columns:minmax(180px,1.2fr) minmax(250px,1.6fr) minmax(170px,1fr) auto;gap:14px 20px;align-items:center;background:#fff;border:1px solid #e1e8e0;border-radius:12px;padding:14px 18px 6px}
+.account-row h3{margin:0;color:#77847a;font-size:11px;font-weight:500}
+.account-row-identity{min-width:0}
+.account-email{display:block;margin-top:3px;font-size:12px;color:#526859;overflow-wrap:anywhere}
+.account-row-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px;font-size:10px;color:#7b887d}
+.account-row-meta .group-chip{font-size:10px;padding:2px 5px}
+.account-row-heading{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:3px}
+.account-row .amount-chip{padding:2px 0;min-height:20px;min-width:0;background:none;font-size:12px;gap:4px}
+.account-row .amount-chip svg{display:none}
+.account-row .quota{width:100%;min-width:0}
+.account-row .quota-label{margin-bottom:3px;font-size:11px}
+.account-row meter{display:block;width:100%;height:5px}
+.quota-expiry{display:block;margin-top:4px;color:#738176;font-size:10px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.account-row .estimate-value{padding:3px 0;min-height:25px;background:none;font-size:17px;gap:5px}
+.account-row .estimate-value svg{width:16px;height:16px}
+.account-row .estimate-empty{font-size:12px}
+.account-row .sample-chip{margin-top:1px;padding:0;background:none;font-size:10px;display:flex;gap:4px}
+.account-row-controls{display:flex;align-items:flex-end;flex-direction:column;gap:3px}
+.account-row-controls .account-toggle{padding:3px 5px;border:0;background:none}
+.account-row-controls .actions{gap:4px}
+.account-row-controls .icon{width:26px;height:26px;padding:5px}
+.account-row-controls .account-reason{margin:0;font-size:10px;max-width:110px}
+.account-row-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;border-top:1px solid #f0f3ed;padding-top:3px;margin-top:-6px}
+.account-row-footer button{font-size:10px;padding:3px 0;display:flex;gap:5px;align-items:center}
+.account-row-footer svg{width:12px;height:12px}
+.account-row-periods{display:grid;gap:10px;min-width:0}
+.account-row-period{display:grid;grid-template-columns:75px minmax(0,1fr);align-items:center;gap:12px}
+.account-row-period .account-row-heading{flex-direction:column;align-items:flex-start;margin:0;gap:2px}
+@media(max-width:1100px){.account-row{grid-template-columns:minmax(0,1fr) auto;gap:12px 18px}.account-row-identity{grid-column:1;grid-row:1}.account-row-controls{grid-column:2;grid-row:1}.account-row-periods{grid-column:1;grid-row:2}.account-row-estimate{grid-column:2;grid-row:2}.account-row-footer{margin-top:-4px}}
+@media(max-width:650px){.account-row{padding:12px 12px 5px;gap:12px}.account-row-periods{grid-column:1/-1;grid-row:2}.account-row-estimate{grid-column:1/-1;grid-row:3;display:flex;align-items:center;flex-wrap:wrap;gap:5px 10px}.quota-expiry{white-space:normal}.account-row .account-title{max-width:100%}}
+
+.cycle-usage{grid-column:1/-1;display:flex;align-items:center;gap:0;margin-top:-5px;color:#7b887d;font-size:10px;line-height:1.5;font-variant-numeric:tabular-nums;flex-wrap:wrap}
+.cycle-usage>span{white-space:nowrap}
+.cycle-usage>span+span:before{content:"·";margin:0 8px;color:#a4afa7}
+.cycle-usage b{font-weight:500;color:#526859;margin-left:3px}
+.cycle-usage>.partial-mark:before{content:none}
+
+.cycle-usage small{font-size:inherit;color:#8b978e}

@@ -1,0 +1,2 @@
+ALTER TABLE accounts ADD COLUMN deleted_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN deleted_at TIMESTAMPTZ;

@@ -118,36 +118,68 @@ impl ErrorFilter {
     }
 }
 
-pub fn weekly_quota_sample(
+/// The currently observed upstream cycle, never a rolling wall-clock window.
+/// A changed expiry or a falling usage counter starts a new observation segment.
+pub struct QuotaCycle<'a> {
+    pub starts_at: DateTime<Utc>,
+    pub first: &'a crate::quota::QuotaWindow,
+    pub latest: &'a crate::quota::QuotaWindow,
+}
+
+pub fn quota_cycle(
     windows: &[crate::quota::QuotaWindow],
+    minutes: i64,
     now: DateTime<Utc>,
-) -> Option<(&crate::quota::QuotaWindow, &crate::quota::QuotaWindow)> {
+) -> Option<QuotaCycle<'_>> {
     let mut points: Vec<_> = windows
         .iter()
         .filter(|w| {
             w.pool == "codex"
-                && w.window_minutes == Some(10080)
+                && w.window_minutes == Some(minutes)
                 && w.used_percent.is_finite()
                 && (0.0..=100.0).contains(&w.used_percent)
                 && w.observed_at <= now
         })
         .collect();
+    // Stable sorting preserves the database's id ordering for equal timestamps.
     points.sort_by_key(|w| w.observed_at);
     let latest = *points.last()?;
     let reset = latest.resets_at.filter(|r| *r > now)?;
-    let mut first = latest;
-    let mut previous = None;
-    for point in points.into_iter().filter(|p| {
-        p.observed_at >= reset - chrono::Duration::days(7)
-            && p.resets_at
-                .is_some_and(|r| (r - reset).num_seconds().abs() <= 60)
-    }) {
-        if previous.is_none_or(|used| point.used_percent < used) {
-            first = point;
-        }
-        previous = Some(point.used_percent);
+    let mut starts_at = reset - chrono::Duration::minutes(minutes);
+    if starts_at > latest.observed_at {
+        return None;
     }
-    (latest.used_percent - first.used_percent >= 1.0).then_some((first, latest))
+    let mut first = latest;
+    for point in points.into_iter().rev().skip(1) {
+        if point.observed_at < starts_at {
+            break;
+        }
+        if point
+            .resets_at
+            .is_none_or(|r| (r - reset).num_seconds().abs() > 60)
+            || point.used_percent > first.used_percent + 0.01
+        {
+            // With unchanged expiry, the first post-reset observation is the
+            // earliest defensible boundary; do not include pre-reset spending.
+            starts_at = starts_at.max(first.observed_at);
+            break;
+        }
+        first = point;
+    }
+    Some(QuotaCycle {
+        starts_at,
+        first,
+        latest,
+    })
+}
+
+pub fn weekly_quota_sample(
+    windows: &[crate::quota::QuotaWindow],
+    now: DateTime<Utc>,
+) -> Option<(&crate::quota::QuotaWindow, &crate::quota::QuotaWindow)> {
+    let cycle = quota_cycle(windows, 10080, now)?;
+    (cycle.latest.used_percent - cycle.first.used_percent >= 1.0)
+        .then_some((cycle.first, cycle.latest))
 }
 
 #[cfg(test)]
@@ -168,7 +200,7 @@ mod tests {
         };
         let mut windows = vec![
             window(20.0, 60, reset),
-            window(100.0, 30, reset - chrono::Duration::days(1)),
+            window(100.0, 90, reset - chrono::Duration::days(1)),
             window(30.0, 0, reset),
         ];
         let (a, b) = weekly_quota_sample(&windows, now).unwrap();

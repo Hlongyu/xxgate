@@ -710,11 +710,28 @@ async fn real_http_postgres_gateway_contract() {
     c.admin("/prices","PUT",Some(json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":rates,"fast_multiplier":"2"}))).await;
     let mut account_ids = vec![];
     for name in ["A", "B"] {
-        let a=c.admin("/accounts","POST",Some(json!({"name":name,"upstream_account_id":format!("mock-account-{name}"),"upstream_base_url":upstream_url,"max_inflight":1,"credentials":{"access_token":format!("PRIVATE_ACCESS_TOKEN_{name}"),"refresh_token":"","expires_at":null}}))).await;
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims = URL_SAFE_NO_PAD.encode(json!({"email":format!("{name}@example.com"),"chatgpt_account_id":format!("mock-account-{name}")}).to_string());
+        let id_token = format!("header.{claims}.PRIVATE_ID_SIGNATURE");
+        let a=c.admin("/accounts","POST",Some(json!({"name":name,"upstream_account_id":format!("mock-account-{name}"),"upstream_base_url":upstream_url,"max_inflight":1,"credentials":{"access_token":format!("PRIVATE_ACCESS_TOKEN_{name}"),"id_token":id_token,"refresh_token":"","expires_at":null}}))).await;
         assert_eq!(a["enabled"], false);
         assert!(!a.to_string().contains("PRIVATE_ACCESS_TOKEN"));
         account_ids.push(a["id"].as_str().unwrap().to_owned());
     }
+    let list = c.admin("/accounts", "GET", None).await;
+    for (id, email) in account_ids.iter().zip(["A@example.com", "B@example.com"]) {
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["account"]["id"] == *id)
+            .unwrap();
+        assert_eq!(item["email"], email);
+        let detail = c.admin(&format!("/accounts/{id}"), "GET", None).await;
+        assert_eq!(detail["email"], email);
+        assert!(!detail.to_string().contains("PRIVATE_"));
+    }
+    assert!(!list.to_string().contains("PRIVATE_"));
     let (a, b) = (&account_ids[0], &account_ids[1]);
     c.admin("/models/sync", "POST", None).await;
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -1689,6 +1706,90 @@ async fn real_http_postgres_gateway_contract() {
         }
     }
     group_contract(&c, &restored, &mock, a, b).await;
+    // Deletion revokes access and survives reload while preserving history.
+    let before = c.admin(&format!("/accounts/{a}"), "GET", None).await;
+    let account_id = Uuid::parse_str(a).unwrap();
+    let stale_account = restored.scheduler.account(account_id).unwrap();
+    c.admin(&format!("/accounts/{a}"), "DELETE", None).await;
+    restored.scheduler.update_account(stale_account);
+    assert!(restored.scheduler.account(account_id).is_none());
+    assert!(
+        !restored
+            .store
+            .accounts()
+            .await
+            .unwrap()
+            .iter()
+            .any(|x| x.id == account_id)
+    );
+    let after = c
+        .admin(&format!("/dashboard?account_id={a}"), "GET", None)
+        .await;
+    assert_eq!(
+        before["statistics"]["summary"]["requests"],
+        after["summary"]["requests"]
+    );
+    for (method, path, body) in [
+        ("GET", format!("/accounts/{a}"), None),
+        (
+            "PUT",
+            format!("/accounts/{a}/enabled"),
+            Some(json!({"enabled":true})),
+        ),
+        ("DELETE", format!("/accounts/{a}"), None),
+    ] {
+        let mut req = c
+            .http
+            .request(
+                method.parse().unwrap(),
+                format!("{}/api/admin{path}", c.base),
+            )
+            .header("x-xxgate-csrf", "1");
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 404);
+    }
+    let created = c
+        .admin("/keys", "POST", Some(json!({"name":"delete regression"})))
+        .await;
+    let key_id = created["key"]["id"].as_str().unwrap();
+    let secret = created["secret"].as_str().unwrap();
+    c.admin(&format!("/keys/{key_id}"), "DELETE", None).await;
+    assert!(
+        restored
+            .store
+            .key_by_hash(&xxgate_core::access::secret_hash(secret))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !restored
+            .store
+            .keys()
+            .await
+            .unwrap()
+            .iter()
+            .any(|k| k.id.to_string() == key_id)
+    );
+    let denied = c
+        .http
+        .get(format!("{}/v1/models", c.base))
+        .bearer_auth(secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 401);
+    let enable = c
+        .http
+        .put(format!("{}/api/admin/keys/{key_id}/enabled", c.base))
+        .header("x-xxgate-csrf", "1")
+        .json(&json!({"enabled":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enable.status(), 404);
     restored.shutdown.cancel();
     restored.tasks.close();
     restored.tasks.wait().await;

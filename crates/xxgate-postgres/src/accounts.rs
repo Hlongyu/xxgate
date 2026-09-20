@@ -74,15 +74,16 @@ impl AccountStore for PgStore {
         catalog: &xxgate_core::providers::AccountModelCatalog,
     ) -> Result<Account> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
-        let row = sqlx::query("SELECT data FROM accounts WHERE id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| Error::storage())?
-            .ok_or_else(Error::not_found)?;
+        let row =
+            sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| Error::storage())?
+                .ok_or_else(Error::not_found)?;
         let mut account: Account = decode(&row)?;
         account.model_catalog = Some(catalog.clone());
-        sqlx::query("UPDATE accounts SET data=$2 WHERE id=$1")
+        sqlx::query("UPDATE accounts SET data=$2 WHERE id=$1 AND deleted_at IS NULL")
             .bind(id)
             .bind(encode(&account)?)
             .execute(&mut *tx)
@@ -91,8 +92,33 @@ impl AccountStore for PgStore {
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(account)
     }
+    async fn delete_account(&self, id: Uuid) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
+        let changed = sqlx::query("UPDATE accounts SET deleted_at=now(),enabled=false,version=version+1,updated_at=now(),data=data || jsonb_build_object('enabled',false,'disable_reason','admin_disabled','version',version+1) WHERE id=$1 AND deleted_at IS NULL")
+            .bind(id).execute(&mut *tx).await.map_err(|_| Error::storage())?.rows_affected();
+        if changed == 0 {
+            return Err(Error::not_found());
+        }
+        sqlx::query("DELETE FROM account_groups WHERE account_id=$1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| Error::storage())?;
+        event_tx(
+            &mut tx,
+            &AuditEvent::new(
+                "account_deleted",
+                "admin",
+                None,
+                Some(id),
+                serde_json::json!({"account_id":id}),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(|_| Error::storage())
+    }
     async fn accounts(&self) -> Result<Vec<Account>> {
-        sqlx::query("SELECT data FROM accounts ORDER BY updated_at DESC")
+        sqlx::query("SELECT data FROM accounts WHERE deleted_at IS NULL ORDER BY updated_at DESC")
             .fetch_all(&self.pool)
             .await
             .map_err(|_| Error::storage())?
@@ -112,12 +138,14 @@ impl AccountStore for PgStore {
         account.updated_at = Utc::now();
         account.version = expected_version.unwrap_or(0) + 1;
         if let Some(expected) = expected_version {
-            let row = sqlx::query("SELECT data FROM accounts WHERE id=$1 FOR UPDATE")
-                .bind(account.id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|_| Error::storage())?
-                .ok_or_else(Error::not_found)?;
+            let row = sqlx::query(
+                "SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+            )
+            .bind(account.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| Error::storage())?
+            .ok_or_else(Error::not_found)?;
             let previous: Account = decode(&row)?;
             if previous.version != expected {
                 return Err(Error::conflict());
@@ -127,7 +155,7 @@ impl AccountStore for PgStore {
             if encrypted.is_some() {
                 account.credential_version += 1;
             }
-            sqlx::query("UPDATE accounts SET version=$2,credential_version=$3,enabled=$4,data=$5,credentials=COALESCE($6,credentials),updated_at=now() WHERE id=$1")
+            sqlx::query("UPDATE accounts SET version=$2,credential_version=$3,enabled=$4,data=$5,credentials=COALESCE($6,credentials),updated_at=now() WHERE id=$1 AND deleted_at IS NULL")
                 .bind(account.id).bind(account.version).bind(account.credential_version).bind(account.enabled).bind(encode(&account)?).bind(encrypted).execute(&mut *tx).await.map_err(|_| Error::storage())?;
         } else {
             account.credential_version = 1;
@@ -152,7 +180,7 @@ impl AccountStore for PgStore {
         Ok(account)
     }
     async fn credentials(&self, id: Uuid) -> Result<Vec<u8>> {
-        sqlx::query_scalar("SELECT credentials FROM accounts WHERE id=$1")
+        sqlx::query_scalar("SELECT credentials FROM accounts WHERE id=$1 AND deleted_at IS NULL")
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -167,12 +195,13 @@ impl AccountStore for PgStore {
         expected_version: i64,
     ) -> Result<Account> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
-        let row = sqlx::query("SELECT data FROM accounts WHERE id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| Error::storage())?
-            .ok_or_else(Error::not_found)?;
+        let row =
+            sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| Error::storage())?
+                .ok_or_else(Error::not_found)?;
         let mut a: Account = decode(&row)?;
         if a.credential_version != expected_version {
             return Err(Error::conflict());
@@ -180,7 +209,7 @@ impl AccountStore for PgStore {
         a.credential_version += 1;
         a.credential_expires_at = expires_at;
         a.updated_at = Utc::now();
-        sqlx::query("UPDATE accounts SET credential_version=$2,credentials=$3,data=$4,updated_at=now() WHERE id=$1").bind(id).bind(a.credential_version).bind(encrypted).bind(encode(&a)?).execute(&mut *tx).await.map_err(|_| Error::storage())?;
+        sqlx::query("UPDATE accounts SET credential_version=$2,credentials=$3,data=$4,updated_at=now() WHERE id=$1 AND deleted_at IS NULL").bind(id).bind(a.credential_version).bind(encrypted).bind(encode(&a)?).execute(&mut *tx).await.map_err(|_| Error::storage())?;
         event_tx(&mut tx, &AuditEvent::new("credentials_updated","oauth",None,Some(id),json!({"credential_version":a.credential_version,"enabled":a.enabled,"expires_at":expires_at}))).await?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(a)
@@ -194,12 +223,13 @@ impl AccountStore for PgStore {
         actor: &str,
     ) -> Result<Account> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
-        let row = sqlx::query("SELECT data FROM accounts WHERE id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| Error::storage())?
-            .ok_or_else(Error::not_found)?;
+        let row =
+            sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| Error::storage())?
+                .ok_or_else(Error::not_found)?;
         let mut a: Account = decode(&row)?;
         if a.version != expected_version {
             return Err(Error::conflict());
@@ -209,7 +239,7 @@ impl AccountStore for PgStore {
         a.disable_reason = if enabled { None } else { reason };
         a.updated_at = Utc::now();
         sqlx::query(
-            "UPDATE accounts SET version=$2,enabled=$3,data=$4,updated_at=now() WHERE id=$1",
+            "UPDATE accounts SET version=$2,enabled=$3,data=$4,updated_at=now() WHERE id=$1 AND deleted_at IS NULL",
         )
         .bind(id)
         .bind(a.version)

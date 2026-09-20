@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 #[async_trait]
 pub trait AccountStore: Send + Sync {
+    async fn delete_account(&self, id: Uuid) -> Result<()>;
     async fn accounts(&self) -> Result<Vec<Account>>;
     async fn put_account(
         &self,
@@ -78,6 +79,7 @@ pub trait IdentityStore: Send + Sync {
 
 #[async_trait]
 pub trait AccessStore: Send + Sync {
+    async fn delete_key(&self, id: Uuid) -> Result<()>;
     async fn initialize_admin(&self, password_hash: &str) -> Result<bool>;
     async fn admin_password_hash(&self) -> Result<Option<String>>;
     async fn put_admin_session(&self, hash: &str, session: &AdminSession) -> Result<()>;

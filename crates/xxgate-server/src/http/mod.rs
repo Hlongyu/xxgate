@@ -75,7 +75,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/accounts/{id}",
-            get(admin::account_detail).put(admin::update_account),
+            get(admin::account_detail)
+                .put(admin::update_account)
+                .delete(admin::delete_account),
         )
         .route("/accounts/{id}/enabled", put(admin::enable_account))
         .route("/accounts/{id}/refresh", post(admin::refresh_account))
@@ -91,7 +93,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/accounts/{id}/models/sync", post(catalog::sync_account))
         .route("/keys", get(admin::keys).post(admin::create_key))
-        .route("/keys/{id}", put(admin::update_key))
+        .route(
+            "/keys/{id}",
+            put(admin::update_key).delete(admin::delete_key),
+        )
         .route("/keys/{id}/enabled", put(admin::enable_key))
         .route("/groups", get(groups::list).post(groups::create))
         .route("/groups/{id}", put(groups::rename).delete(groups::remove))
