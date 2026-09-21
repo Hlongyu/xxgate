@@ -78,7 +78,24 @@ impl ProviderDecoder for CodexDecoder {
                     Error::new(502, "invalid_upstream_event", "Upstream event has no type")
                 })?
                 .to_owned();
-            let mut observation = Observation::default();
+            let mut observation = Observation {
+                recovery_preamble: matches!(
+                    kind.as_str(),
+                    "response.created" | "response.queued" | "response.in_progress"
+                ) && value.get("response").is_some_and(no_reported_work)
+                    && value.get("item").is_none()
+                    && value.get("delta").is_none(),
+                ..Default::default()
+            };
+            if matches!(kind.as_str(), "response.failed" | "error") {
+                let body = value.get("response").unwrap_or(&value);
+                if no_reported_work(body)
+                    && value.get("item").is_none()
+                    && value.get("delta").is_none()
+                {
+                    observation.encrypted_rejection = super::recovery::rejection(body);
+                }
+            }
             if kind == "response.output_item.done" && value["item"]["type"] == "compaction" {
                 self.compaction_output = true;
             }
@@ -193,6 +210,22 @@ impl ProviderDecoder for CodexDecoder {
     fn buffered_bytes(&self) -> usize {
         self.sse.buffered_bytes()
     }
+}
+
+fn no_reported_work(value: &Value) -> bool {
+    fn no_usage(value: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::Number(n) => n.as_u64() == Some(0),
+            Value::Object(o) => o.values().all(no_usage),
+            _ => false,
+        }
+    }
+    value.is_object()
+        && value
+            .get("output")
+            .is_none_or(|output| output.is_null() || output.as_array().is_some_and(Vec::is_empty))
+        && value.get("usage").is_none_or(no_usage)
 }
 
 impl CodexDecoder {

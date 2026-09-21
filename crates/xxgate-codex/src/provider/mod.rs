@@ -21,13 +21,23 @@ use xxgate_core::{
 
 pub struct CodexProvider;
 impl ProviderAdapter for CodexProvider {
+    fn has_recoverable_encrypted_input(&self, request: &PreparedRequest) -> bool {
+        recovery::has_recoverable_input(request)
+    }
+    fn recover_encrypted_stream(
+        &self,
+        request: &mut xxgate_core::protocol::PreparedRequest,
+        error: xxgate_core::protocol::EncryptedContentError,
+    ) -> Result<Option<xxgate_core::protocol::EncryptedContentRecovery>> {
+        recovery::clean(request, error)
+    }
     fn recover_encrypted_reasoning(
         &self,
         kind: xxgate_core::protocol::RequestKind,
         request: &mut PreparedRequest,
         status: u16,
         error_body: &[u8],
-    ) -> Result<Option<xxgate_core::protocol::EncryptedReasoningRecovery>> {
+    ) -> Result<Option<xxgate_core::protocol::EncryptedContentRecovery>> {
         recovery::prepare(kind, request, status, error_body)
     }
     fn compact_response(&self, body: &[u8]) -> Result<Observation> {
@@ -304,7 +314,13 @@ fn error_facts(value: Option<&serde_json::Value>) -> Option<xxgate_core::types::
             ]
             .contains(param)
         });
-    let reason = if unsupported.is_some()
+    let reason = if message == "Our servers are currently overloaded. Please try again later." {
+        Some("upstream_overloaded")
+    } else if code == Some("invalid_encrypted_content")
+        && message == "Encrypted function output content could not be decrypted or decoded."
+    {
+        Some("invalid_encrypted_tool_output")
+    } else if unsupported.is_some()
         || matches!(code, Some("unsupported_parameter" | "unknown_parameter"))
     {
         Some("unsupported_parameter")

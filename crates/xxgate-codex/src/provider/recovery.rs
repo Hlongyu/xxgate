@@ -1,30 +1,88 @@
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{Value, json};
 use xxgate_core::{
     Error, Result,
-    protocol::{EncryptedReasoningRecovery, PreparedRequest, RequestKind},
+    protocol::{EncryptedContentError, EncryptedContentRecovery, PreparedRequest, RequestKind},
 };
 
-/// Only an explicit HTTP rejection qualifies. A message substring, SSE error,
-/// failed transport, Compact or Search request must never cause another send.
+/// HTTP recovery requires an explicit 400. SSE recovery is separately gated by
+/// the decoder and by the gateway's undispatched preamble buffer.
 pub(super) fn prepare(
     kind: RequestKind,
     request: &mut PreparedRequest,
     status: u16,
     error_body: &[u8],
-) -> Result<Option<EncryptedReasoningRecovery>> {
+) -> Result<Option<EncryptedContentRecovery>> {
     if kind != RequestKind::Responses || status != 400 {
         return Ok(None);
     }
     let Ok(error) = serde_json::from_slice::<Value>(error_body) else {
         return Ok(None);
     };
-    if error.pointer("/error/code").and_then(Value::as_str) != Some("invalid_encrypted_content") {
+    let Some(error) = rejection(&error) else {
         return Ok(None);
+    };
+    clean(request, error)
+}
+
+pub(super) fn rejection(value: &Value) -> Option<EncryptedContentError> {
+    if value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        != Some("invalid_encrypted_content")
+    {
+        return None;
     }
+    let message = value
+        .pointer("/error/message")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(
+        if message == "Encrypted function output content could not be decrypted or decoded." {
+            EncryptedContentError::ToolOutput
+        } else {
+            EncryptedContentError::Reasoning
+        },
+    )
+}
+
+fn tool_output(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    )
+}
+
+pub(super) fn has_recoverable_input(request: &PreparedRequest) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        return false;
+    };
+    let has = |item: &Value| {
+        (item["type"] == "reasoning" && item.get("encrypted_content").is_some())
+            || (tool_output(item)
+                && item["output"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|p| p["type"] == "encrypted_content")))
+    };
+    match body.get("input") {
+        Some(Value::Array(items)) => items.iter().any(has),
+        Some(item @ Value::Object(_)) => has(item),
+        _ => false,
+    }
+}
+
+pub(super) fn clean(
+    request: &mut PreparedRequest,
+    error: EncryptedContentError,
+) -> Result<Option<EncryptedContentRecovery>> {
     let mut body: Value = serde_json::from_slice(&request.body)
         .map_err(|_| Error::invalid("Unable to prepare encrypted reasoning recovery"))?;
-    let mut changes = EncryptedReasoningRecovery::default();
+    let mut changes = EncryptedContentRecovery {
+        error_kind: error,
+        ..Default::default()
+    };
     match body.get_mut("input") {
         Some(Value::Array(items)) => items.retain_mut(|item| clean_item(item, &mut changes)),
         Some(item @ Value::Object(_)) => {
@@ -34,7 +92,7 @@ pub(super) fn prepare(
         }
         _ => {}
     }
-    if changes.encrypted_fields_removed == 0 {
+    if changes.encrypted_fields_removed == 0 && changes.encrypted_tool_parts_replaced == 0 {
         return Ok(None);
     }
     request.body = Bytes::from(
@@ -44,7 +102,27 @@ pub(super) fn prepare(
     Ok(Some(changes))
 }
 
-fn clean_item(item: &mut Value, changes: &mut EncryptedReasoningRecovery) -> bool {
+fn clean_item(item: &mut Value, changes: &mut EncryptedContentRecovery) -> bool {
+    if matches!(changes.error_kind, EncryptedContentError::ToolOutput) {
+        if tool_output(item)
+            && let Some(parts) = item.get_mut("output").and_then(Value::as_array_mut)
+        {
+            let before = changes.encrypted_tool_parts_replaced;
+            for part in parts {
+                if part["type"] == "encrypted_content" {
+                    // Preserve call identity and every usable text/image part.
+                    // Never fabricate a successful result or silently lose the
+                    // fact that an already executed tool's result is unavailable.
+                    *part = json!({"type":"input_text","text":"[XXGate: An encrypted part of this historical tool result was rejected by the upstream and is unavailable. The tool may already have executed. Do not infer success or failure, or repeat side-effecting actions solely because this result is unavailable.]"});
+                    changes.encrypted_tool_parts_replaced += 1;
+                }
+            }
+            if changes.encrypted_tool_parts_replaced > before {
+                changes.tool_outputs_changed += 1;
+            }
+        }
+        return true;
+    }
     if item.get("type").and_then(Value::as_str).map(str::trim) != Some("reasoning") {
         return true;
     }
@@ -179,5 +257,68 @@ mod tests {
             value["input"],
             json!({"type":"reasoning","summary":[],"content":[{"text":"retained"}]})
         );
+    }
+
+    #[test]
+    fn tool_recovery_marks_unavailable_parts_and_preserves_call_identity_and_plaintext() {
+        let original = json!([
+            {"type":"function_call","id":"fc_a","call_id":"a","encrypted_function_args":["PRIVATE_ARGS"],"arguments":"{}"},
+            {"type":"function_call_output","call_id":"a","id":"fco_a","output":[{"type":"input_text","text":"PRIVATE_TEXT"},{"type":"encrypted_content","encrypted_content":"PRIVATE_CIPHER"},{"type":"input_image","image_url":"PRIVATE_IMAGE"}]},
+            {"type":"custom_tool_call_output","call_id":"b","output":[{"type":"encrypted_content","encrypted_content":"PRIVATE_ONLY_CIPHER"}],"extension":true},
+            {"type":"reasoning","encrypted_content":"PRIVATE_REASONING","summary":[]},
+            {"type":"compaction","encrypted_content":"PRIVATE_COMPACTION"},
+            {"type":"function_call_output","call_id":"c","output":"PRIVATE_PLAIN_STRING"}
+        ]);
+        let mut req = request(original.clone());
+        assert!(has_recoverable_input(&req));
+        let changes = prepare(RequestKind::Responses, &mut req, 400, br#"{"error":{"code":"invalid_encrypted_content","message":"Encrypted function output content could not be decrypted or decoded."}}"#).unwrap().unwrap();
+        assert_eq!(changes.tool_outputs_changed, 2);
+        assert_eq!(changes.encrypted_tool_parts_replaced, 2);
+        assert_eq!(changes.encrypted_fields_removed, 0);
+        let after: Value = serde_json::from_slice(&req.body).unwrap();
+        let mut expected = original;
+        let marker = after["input"][1]["output"][1].clone();
+        assert_eq!(marker["type"], "input_text");
+        assert!(
+            marker["text"]
+                .as_str()
+                .unwrap()
+                .contains("may already have executed")
+        );
+        expected[1]["output"][1] = marker.clone();
+        expected[2]["output"][0] = marker;
+        assert_eq!(after["input"], expected);
+        assert!(
+            !serde_json::to_string(&changes)
+                .unwrap()
+                .contains("PRIVATE_")
+        );
+        assert!(
+            clean(&mut req, EncryptedContentError::ToolOutput)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_error_code_and_specific_tool_error_select_cleanup_without_guessing() {
+        assert!(rejection(&json!({"error":{"message":"invalid_encrypted_content"}})).is_none());
+        assert!(matches!(
+            rejection(
+                &json!({"code":"invalid_encrypted_content","message":"Encrypted function output content could not be decrypted or decoded."})
+            ),
+            Some(EncryptedContentError::ToolOutput)
+        ));
+        let mut req = request(
+            json!([{"type":"function_call_output","output":"ordinary"},{"type":"message","content":[{"type":"encrypted_content","encrypted_content":"KEEP"}]}]),
+        );
+        let before = req.body.clone();
+        assert!(!has_recoverable_input(&req));
+        assert!(
+            clean(&mut req, EncryptedContentError::ToolOutput)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(req.body, before);
     }
 }

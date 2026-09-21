@@ -6,7 +6,10 @@ use crate::{
     audit::{AuditEvent, RequestRecord},
     identity::{IdentityMap, SessionKey, ThreadKey},
     pricing::{Price, value_usage},
-    protocol::{GatewayRequest, IngressAdapter, ProviderAdapter, RequestKind, UpstreamTransport},
+    protocol::{
+        EncryptedContentRecovery, GatewayRequest, IngressAdapter, ProviderAdapter, RequestKind,
+        UpstreamTransport,
+    },
     providers::ModelSpec,
     scheduling::{BudgetedBytes, DispatchLease, MemoryBudget, MemoryLease, QueueTicket, Scheduler},
     settings::LiveSettings,
@@ -418,7 +421,7 @@ impl Gateway {
         self.store.append_event(&AuditEvent::new("dispatched", "gateway", Some(e.record.id), e.record.account_id, json!({"group_id":lease.binding.group_id,"binding_id":e.record.binding_id,"generation":e.record.binding_generation,"stateless":request.stateless,"queue_ms":e.record.queue_ms,"client_profile_version":lease.account.version,"codex_version":lease.account.profile.codex_version}))).await?;
         let started = Instant::now();
         let mut cfg = self.settings.subscribe();
-        let mut response = loop {
+        'attempt: loop {
             if cancel.is_cancelled() || tx.is_closed() {
                 return Err(Error::cancelled());
             }
@@ -463,187 +466,241 @@ impl Gateway {
                 &header_observation.quotas,
             )
             .await?;
-            if (200..300).contains(&response.status) {
-                break response;
-            }
-            let reading = read_limited(&mut response.bytes, 64 * 1024);
-            tokio::pin!(reading);
-            let body = loop {
-                let snapshot = cfg.borrow_and_update().clone();
-                self.note_config(e, snapshot.version);
-                tokio::select! {
-                    biased;
-                    _=cfg.changed()=>{},
-                    _=tokio::time::sleep_until(attempt_started+Duration::from_millis(snapshot.sse_idle_timeout_ms))=>return Err(Error::new(504,"upstream_error_body_timeout","Upstream error response timed out")),
-                    result=&mut reading=>break result?,
-                }
-            };
-            if e.record.upstream_attempts == 1
-                && let Some(cleanup) = self.provider.recover_encrypted_reasoning(
-                    request.kind,
-                    &mut prepared,
-                    response.status,
-                    &body,
-                )?
-            {
-                // The rejected request never entered the model-event stream.
-                // Keep the account, identity mapping, price and capacity lease.
-                self.store
-                    .append_event(&AuditEvent::new(
-                        "encrypted_reasoning_recovery",
-                        "gateway",
-                        Some(e.record.id),
-                        e.record.account_id,
-                        json!({"failed_attempt":1,"retry_attempt":2,"status":400,
-                        "reason":"invalid_encrypted_content","cleanup":cleanup,
-                        "binding_id":e.record.binding_id}),
-                    ))
-                    .await?;
-                let current_model = self
-                    .store
-                    .models()
-                    .await?
-                    .into_iter()
-                    .find(|m| m.id == model.id && m.enabled)
-                    .ok_or_else(|| {
-                        Error::new(
-                            400,
-                            "model_disabled",
-                            "The model was disabled before recovery",
-                        )
-                    })?;
-                if current_model.upstream != model.upstream {
-                    return Err(Error::new(
-                        409,
-                        "model_route_changed",
-                        "The model route changed before recovery",
-                    ));
-                }
-                self.provider.validate(request, &current_model)?;
-                if cancel.is_cancelled() || tx.is_closed() {
-                    return Err(Error::cancelled());
-                }
-                lease.begin_encrypted_reasoning_recovery()?;
-                e.record.upstream_attempts = 2;
-                e.record.upstream_status = None;
-                e.record.upstream_headers_ms = None;
-                e.record.upstream_request_id = None;
-                self.store.update_request(&e.record).await?;
-                continue;
-            }
-            let (error, disable) = self.provider.http_error(response.status, &body);
-            if request.kind == RequestKind::Search {
-                let mut memory = self.memory.lease();
-                memory.resize(body.len())?;
-                e.raw_body = Some(Bytes::from_owner(BudgetedBytes {
-                    bytes: body,
-                    lease: memory,
-                }));
-                e.record.usage.source = "search_http_error".into();
-                e.record.usage.complete = true;
-            }
-            if let Some(reason) = disable {
-                self.disable_observed(lease.account.id, lease.account.version, reason)
-                    .await?;
-            }
-            return Err(error);
-        };
-        if request.kind == RequestKind::Compact
-            && let Some(value) = response.headers.get("x-codex-turn-state")
-        {
-            e.response_headers
-                .insert("x-codex-turn-state", value.clone());
-        }
-        if matches!(request.kind, RequestKind::Search | RequestKind::Compact) {
-            return self.receive_unary(response.bytes, e, since, started).await;
-        }
-        let mut decoder = self.provider.decoder();
-        let mut last_event = Instant::now();
-        let mut decode_memory = self.memory.lease();
-        loop {
-            let snapshot = cfg.borrow_and_update().clone();
-            self.note_config(e, snapshot.version);
-            let next = tokio::select! {
-                biased;
-                _ = cfg.changed() => continue,
-                _ = tokio::time::sleep_until(last_event + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => return Err(Error::new(504, "upstream_idle_timeout", "Upstream SSE idle timeout")),
-                next = response.bytes.next() => next,
-            };
-            let Some(chunk) = next else {
-                decoder.finish()?;
-                return Err(Error::new(
-                    502,
-                    "stream_interrupted",
-                    "Upstream closed before a terminal event",
-                ));
-            };
-            let chunk = chunk?;
-            decode_memory.resize((decoder.buffered_bytes() + chunk.len()).saturating_mul(3))?;
-            let events = decoder.push(
-                &chunk,
-                &mut ids,
-                self.settings.current().sse_event_limit_bytes,
-            )?;
-            if !events.is_empty() {
-                last_event = Instant::now();
-                e.record
-                    .first_event_ms
-                    .get_or_insert(started.elapsed().as_millis() as u64);
-            }
-            let pending = ids.take_pending();
-            if !request.stateless {
-                self.store.save_mappings(ids.binding.id, &pending).await?;
-            }
-            for event in events {
-                if let Some(model) = event.observation.response_model {
-                    e.record.response_model = Some(model);
-                }
-                if let Some(compaction) = &mut e.record.compaction
-                    && let Some(observed) = event.observation.compaction_output
+            if !(200..300).contains(&response.status) {
+                let reading = read_limited(&mut response.bytes, 64 * 1024);
+                tokio::pin!(reading);
+                let body = loop {
+                    let snapshot = cfg.borrow_and_update().clone();
+                    self.note_config(e, snapshot.version);
+                    tokio::select! {
+                        biased;
+                        _=cfg.changed()=>{},
+                        _=tokio::time::sleep_until(attempt_started+Duration::from_millis(snapshot.sse_idle_timeout_ms))=>return Err(Error::new(504,"upstream_error_body_timeout","Upstream error response timed out")),
+                        result=&mut reading=>break result?,
+                    }
+                };
+                if e.record.upstream_attempts == 1
+                    && let Some(cleanup) = self.provider.recover_encrypted_reasoning(
+                        request.kind,
+                        &mut prepared,
+                        response.status,
+                        &body,
+                    )?
                 {
-                    compaction.output_observed = Some(observed);
+                    self.begin_recovery(request, model, e, &lease, cleanup, "http_error")
+                        .await?;
+                    continue 'attempt;
                 }
-                if event.observation.content {
-                    e.record
-                        .first_content_ms
-                        .get_or_insert(started.elapsed().as_millis() as u64);
+                let (error, disable) = self.provider.http_error(response.status, &body);
+                if request.kind == RequestKind::Search {
+                    let mut memory = self.memory.lease();
+                    memory.resize(body.len())?;
+                    e.raw_body = Some(Bytes::from_owner(BudgetedBytes {
+                        bytes: body,
+                        lease: memory,
+                    }));
+                    e.record.usage.source = "search_http_error".into();
+                    e.record.usage.complete = true;
                 }
-                if let Some(usage) = event.observation.usage {
-                    e.record.usage = usage;
-                }
-                self.apply_quotas(
-                    lease.account.id,
-                    lease.account.version,
-                    &event.observation.quotas,
-                )
-                .await?;
-                if let Some(reason) = event.observation.disable_reason {
+                if let Some(reason) = disable {
                     self.disable_observed(lease.account.id, lease.account.version, reason)
                         .await?;
                 }
-                if event.observation.terminal {
-                    if !request.stream {
-                        e.unary = self.ingress.unary_response(&event.document);
+                return Err(error);
+            }
+            if request.kind == RequestKind::Compact
+                && let Some(value) = response.headers.get("x-codex-turn-state")
+            {
+                e.response_headers
+                    .insert("x-codex-turn-state", value.clone());
+            }
+            if matches!(request.kind, RequestKind::Search | RequestKind::Compact) {
+                return self.receive_unary(response.bytes, e, since, started).await;
+            }
+            let mut decoder = self.provider.decoder();
+            let mut buffering = e.record.upstream_attempts == 1
+                && self.provider.has_recoverable_encrypted_input(&prepared);
+            let mut preamble = Vec::new();
+            let mut preamble_bytes = 0usize;
+            let mut preamble_memory = self.memory.lease();
+            let mut last_heartbeat = Instant::now();
+            let mut last_event = Instant::now();
+            let mut decode_memory = self.memory.lease();
+            loop {
+                let snapshot = cfg.borrow_and_update().clone();
+                self.note_config(e, snapshot.version);
+                let next = tokio::select! {
+                    biased;
+                    _ = cfg.changed() => continue,
+                    _ = tokio::time::sleep_until(last_event + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => return Err(Error::new(504, "upstream_idle_timeout", "Upstream SSE idle timeout")),
+                    _ = tokio::time::sleep_until(last_heartbeat + Duration::from_millis(snapshot.heartbeat_interval_ms)), if buffering && request.stream => {
+                        self.send(tx, self.ingress.heartbeat(e.record.id), last_event, false).await?;
+                        last_heartbeat = Instant::now();
+                        continue;
+                    },
+                    next = response.bytes.next() => next,
+                };
+                let Some(chunk) = next else {
+                    decoder.finish()?;
+                    return Err(Error::new(
+                        502,
+                        "stream_interrupted",
+                        "Upstream closed before a terminal event",
+                    ));
+                };
+                let chunk = chunk?;
+                decode_memory.resize((decoder.buffered_bytes() + chunk.len()).saturating_mul(3))?;
+                let events = decoder.push(
+                    &chunk,
+                    &mut ids,
+                    self.settings.current().sse_event_limit_bytes,
+                )?;
+                if !events.is_empty() {
+                    last_event = Instant::now();
+                    e.record
+                        .first_event_ms
+                        .get_or_insert(started.elapsed().as_millis() as u64);
+                }
+                let pending = ids.take_pending();
+                if !request.stateless {
+                    self.store.save_mappings(ids.binding.id, &pending).await?;
+                }
+                for event in events {
+                    if buffering
+                        && let Some(error) = event.observation.encrypted_rejection
+                        && let Some(cleanup) = self
+                            .provider
+                            .recover_encrypted_stream(&mut prepared, error)?
+                    {
+                        self.begin_recovery(request, model, e, &lease, cleanup, "sse_error")
+                            .await?;
+                        continue 'attempt;
                     }
-                    self.finalize(e, event.observation.error.as_ref(), since)
-                        .await?;
-                    if request.stream {
+                    if buffering {
+                        let bytes = self.ingress.encode(&event.document)?;
+                        if event.observation.recovery_preamble
+                            && preamble.len() < 16
+                            && preamble_bytes + bytes.len() <= 64 * 1024
+                        {
+                            preamble_bytes += bytes.len();
+                            preamble_memory.resize(preamble_bytes)?;
+                            preamble.push(bytes);
+                        } else {
+                            buffering = false;
+                            if request.stream {
+                                for bytes in preamble.drain(..) {
+                                    self.send(tx, bytes, last_event, false).await?;
+                                }
+                            }
+                            preamble.clear();
+                            preamble_memory.resize(0)?;
+                        }
+                    }
+                    if let Some(model) = event.observation.response_model {
+                        e.record.response_model = Some(model);
+                    }
+                    if let Some(compaction) = &mut e.record.compaction
+                        && let Some(observed) = event.observation.compaction_output
+                    {
+                        compaction.output_observed = Some(observed);
+                    }
+                    if event.observation.content {
+                        e.record
+                            .first_content_ms
+                            .get_or_insert(started.elapsed().as_millis() as u64);
+                    }
+                    if let Some(usage) = event.observation.usage {
+                        e.record.usage = usage;
+                    }
+                    self.apply_quotas(
+                        lease.account.id,
+                        lease.account.version,
+                        &event.observation.quotas,
+                    )
+                    .await?;
+                    if let Some(reason) = event.observation.disable_reason {
+                        self.disable_observed(lease.account.id, lease.account.version, reason)
+                            .await?;
+                    }
+                    if event.observation.terminal {
+                        if !request.stream {
+                            e.unary = self.ingress.unary_response(&event.document);
+                        }
+                        self.finalize(e, event.observation.error.as_ref(), since)
+                            .await?;
+                        if request.stream {
+                            self.send(tx, self.ingress.encode(&event.document)?, last_event, false)
+                                .await?;
+                        }
+                        e.terminal_delivered = true;
+                        return match event.observation.error {
+                            Some(error) => Err(error),
+                            None => Ok(()),
+                        };
+                    }
+                    if request.stream && !buffering {
                         self.send(tx, self.ingress.encode(&event.document)?, last_event, false)
                             .await?;
                     }
-                    e.terminal_delivered = true;
-                    return match event.observation.error {
-                        Some(error) => Err(error),
-                        None => Ok(()),
-                    };
                 }
-                if request.stream {
-                    self.send(tx, self.ingress.encode(&event.document)?, last_event, false)
-                        .await?;
-                }
+                decode_memory.resize(decoder.buffered_bytes().saturating_mul(3))?;
             }
-            decode_memory.resize(decoder.buffered_bytes().saturating_mul(3))?;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_recovery(
+        &self,
+        request: &GatewayRequest,
+        model: &ModelSpec,
+        e: &mut Execution,
+        lease: &DispatchLease,
+        cleanup: EncryptedContentRecovery,
+        source: &str,
+    ) -> Result<()> {
+        // Keep the legacy event kind so existing history and clients remain readable.
+        self.store
+            .append_event(&AuditEvent::new(
+                "encrypted_reasoning_recovery",
+                "gateway",
+                Some(e.record.id),
+                e.record.account_id,
+                json!({"failed_attempt":1,"retry_attempt":2,"status":e.record.upstream_status,
+                "source":source,"reason":"invalid_encrypted_content","cleanup":cleanup,
+                "binding_id":e.record.binding_id}),
+            ))
+            .await?;
+        let current_model = self
+            .store
+            .models()
+            .await?
+            .into_iter()
+            .find(|m| m.id == model.id && m.enabled)
+            .ok_or_else(|| {
+                Error::new(
+                    400,
+                    "model_disabled",
+                    "The model was disabled before recovery",
+                )
+            })?;
+        if current_model.upstream != model.upstream {
+            return Err(Error::new(
+                409,
+                "model_route_changed",
+                "The model route changed before recovery",
+            ));
+        }
+        self.provider.validate(request, &current_model)?;
+        lease.begin_encrypted_reasoning_recovery()?;
+        e.record.upstream_attempts = 2;
+        e.record.upstream_status = None;
+        e.record.upstream_headers_ms = None;
+        e.record.upstream_request_id = None;
+        e.record.first_event_ms = None;
+        e.record.first_content_ms = None;
+        e.record.response_model = None;
+        e.record.usage = Usage::default();
+        self.store.update_request(&e.record).await
     }
 
     async fn receive_unary(

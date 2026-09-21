@@ -97,7 +97,6 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock) {
             ("encrypted-always", 2, false),
             ("encrypted-wrong-code", 1, false),
             ("encrypted-server-error", 1, false),
-            ("encrypted-sse", 1, false),
         ] {
             let before = mock.calls.load(Ordering::SeqCst);
             let response = request(c, behavior, stream).await;

@@ -86,10 +86,21 @@ pub struct PreparedRequest {
 
 /// Counts only: never persist removed ciphertext, summaries, or input content.
 #[derive(Debug, Default, serde::Serialize)]
-pub struct EncryptedReasoningRecovery {
+pub struct EncryptedContentRecovery {
+    pub error_kind: EncryptedContentError,
     pub encrypted_fields_removed: usize,
     pub null_content_fields_removed: usize,
     pub empty_reasoning_items_removed: usize,
+    pub encrypted_tool_parts_replaced: usize,
+    pub tool_outputs_changed: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptedContentError {
+    #[default]
+    Reasoning,
+    ToolOutput,
 }
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
@@ -102,6 +113,10 @@ pub struct UpstreamResponse {
 
 #[derive(Default)]
 pub struct Observation {
+    /// Control-only event that can be held before exposing a response identity.
+    pub recovery_preamble: bool,
+    /// An explicit encrypted-content rejection without output or reported work.
+    pub encrypted_rejection: Option<EncryptedContentError>,
     pub response_model: Option<String>,
     pub compaction_output: Option<bool>,
     pub usage: Option<Usage>,
@@ -157,7 +172,13 @@ pub trait ProviderAdapter: Send + Sync {
         request: &mut PreparedRequest,
         status: u16,
         error_body: &[u8],
-    ) -> Result<Option<EncryptedReasoningRecovery>>;
+    ) -> Result<Option<EncryptedContentRecovery>>;
+    fn has_recoverable_encrypted_input(&self, request: &PreparedRequest) -> bool;
+    fn recover_encrypted_stream(
+        &self,
+        request: &mut PreparedRequest,
+        error: EncryptedContentError,
+    ) -> Result<Option<EncryptedContentRecovery>>;
     fn refresh_request(
         &self,
         account: &Account,

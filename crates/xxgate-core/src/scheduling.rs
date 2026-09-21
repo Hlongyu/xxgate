@@ -643,7 +643,7 @@ impl DispatchLease {
         self.begin_attempt(0)
     }
     /// One additional send, only after the provider confirms a recoverable
-    /// encrypted-reasoning HTTP rejection. Retains the original capacity lease.
+    /// encrypted-content rejection. Retains the original capacity lease.
     pub(crate) fn begin_encrypted_reasoning_recovery(&self) -> Result<()> {
         self.begin_attempt(1)
     }

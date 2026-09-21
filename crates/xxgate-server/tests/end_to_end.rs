@@ -19,6 +19,9 @@ mod session_concurrency_contract;
 #[path = "support/encrypted_reasoning_recovery.rs"]
 mod encrypted_reasoning_recovery_contract;
 
+#[path = "support/stream_recovery.rs"]
+mod stream_recovery_contract;
+
 #[path = "support/turn_state.rs"]
 mod turn_state_contract;
 
@@ -301,6 +304,9 @@ async fn upstream(
         }
     }
     let behavior = body["instructions"].as_str().unwrap_or("normal").to_owned();
+    if let Some(response) = stream_recovery_contract::upstream(&mock, &body, &behavior) {
+        return response;
+    }
     if let Some(response) =
         encrypted_reasoning_recovery_contract::rejection(&mock, &body, &behavior)
     {
@@ -1288,6 +1294,7 @@ async fn real_http_postgres_gateway_contract() {
     let routed_record_id = model_routing_contract::verify(&c).await;
     session_concurrency_contract::verify(&c, &gateway, &mock, a, b).await;
     encrypted_reasoning_recovery_contract::verify(&c, &gateway, &mock).await;
+    stream_recovery_contract::verify(&c, &gateway, &mock).await;
     turn_state_contract::verify(&c, &mock).await;
 
     // Quota exhaustion is sticky until the administrator explicitly reenables the account.
