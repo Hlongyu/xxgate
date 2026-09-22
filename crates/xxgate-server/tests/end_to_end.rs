@@ -717,7 +717,7 @@ async fn real_http_postgres_gateway_contract() {
     let mut account_ids = vec![];
     for name in ["A", "B"] {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        let claims = URL_SAFE_NO_PAD.encode(json!({"email":format!("{name}@example.com"),"chatgpt_account_id":format!("mock-account-{name}")}).to_string());
+        let claims = URL_SAFE_NO_PAD.encode(json!({"email":format!("{name}@example.com"),"chatgpt_account_id":format!("mock-account-{name}"),"chatgpt_plan_type":if name=="A" {Some("free")} else {None}}).to_string());
         let id_token = format!("header.{claims}.PRIVATE_ID_SIGNATURE");
         let a=c.admin("/accounts","POST",Some(json!({"name":name,"upstream_account_id":format!("mock-account-{name}"),"upstream_base_url":upstream_url,"max_inflight":1,"credentials":{"access_token":format!("PRIVATE_ACCESS_TOKEN_{name}"),"id_token":id_token,"refresh_token":"","expires_at":null}}))).await;
         assert_eq!(a["enabled"], false);
@@ -733,8 +733,16 @@ async fn real_http_postgres_gateway_contract() {
             .find(|item| item["account"]["id"] == *id)
             .unwrap();
         assert_eq!(item["email"], email);
+        let plan = if email == "A@example.com" {
+            json!("free")
+        } else {
+            Value::Null
+        };
+        assert_eq!(item["plan_type"], plan);
         let detail = c.admin(&format!("/accounts/{id}"), "GET", None).await;
         assert_eq!(detail["email"], email);
+        assert_eq!(detail["plan_type"], plan);
+        assert_eq!(detail["spending"]["last_30d"]["status"], "unknown_cycle");
         assert!(!detail.to_string().contains("PRIVATE_"));
     }
     assert!(!list.to_string().contains("PRIVATE_"));
@@ -1674,6 +1682,7 @@ async fn real_http_postgres_gateway_contract() {
     // above remains uncompressed even when the caller advertises both codecs.
     for path in [
         "/assets/app.js",
+        "/assets/account-quotas.js",
         "/assets/error-center.js",
         "/api/admin/requests?limit=25",
         "/api/admin/request-errors",
@@ -1706,7 +1715,13 @@ async fn real_http_postgres_gateway_contract() {
                     .contains("accept-encoding")
             );
             let encoded = response.bytes().await.unwrap();
-            assert!(encoded.len() < plain.len() / 2);
+            // The small quota helper has less repeated text than large pages/JSON.
+            let limit = if path == "/assets/account-quotas.js" {
+                plain.len()
+            } else {
+                plain.len() / 2
+            };
+            assert!(encoded.len() < limit, "compression for {path}");
             if encoding == "gzip" {
                 assert_eq!(&encoded[..2], &[0x1f, 0x8b]);
             }

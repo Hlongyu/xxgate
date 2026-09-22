@@ -149,3 +149,33 @@ pub(crate) fn windows(value: &Value, source: &str) -> Vec<QuotaWindow> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn free_thirty_day_window_matches_usage_and_headers_and_can_disable() {
+        let body = serde_json::json!({"plan_type":"free","rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":2592000,"reset_at":1800000000},"secondary_window":null}});
+        let from_usage = response(&serde_json::to_vec(&body).unwrap()).unwrap();
+        let mut h = HeaderMap::new();
+        for (key, value) in [
+            ("x-codex-primary-used-percent", "100"),
+            ("x-codex-primary-window-minutes", "43200"),
+            ("x-codex-primary-reset-at", "1800000000"),
+        ] {
+            h.insert(key, value.parse().unwrap());
+        }
+        let from_headers = headers(&h);
+        for windows in [&from_usage, &from_headers] {
+            assert_eq!(windows.len(), 1);
+            assert_eq!(windows[0].window_minutes, Some(43200));
+            assert_eq!(windows[0].used_percent, 100.0);
+            assert_eq!(
+                windows[0].disable_reason(),
+                Some(xxgate_core::accounts::DisableReason::QuotaExhausted)
+            );
+        }
+        assert_eq!(from_usage[0].resets_at, from_headers[0].resets_at);
+    }
+}

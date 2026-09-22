@@ -1,10 +1,12 @@
--- A single snapshot for both current quota cycles and the weekly estimate.
+-- A single snapshot for current quota cycles and their estimates.
 -- Only the two partial boundary hours read numeric entries; all interior
 -- hours read incrementally maintained totals. The lower bound is exclusive.
 WITH windows(label, starts_at, ends_at, main_only) AS (
     VALUES ('last_5h', $5::timestamptz, $2, false),
            ('last_7d', $6::timestamptz, $2, false),
-           ('weekly', $3::timestamptz, $4::timestamptz, true)
+           ('last_30d', $7::timestamptz, $2, false),
+           ('weekly', $3::timestamptz, $4::timestamptz, true),
+           ('monthly', $8::timestamptz, $9::timestamptz, true)
 ), bounds AS (
     SELECT *, date_trunc('hour', starts_at, 'UTC') AS start_hour,
               date_trunc('hour', ends_at, 'UTC') AS end_hour

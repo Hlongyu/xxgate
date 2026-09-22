@@ -32,14 +32,15 @@ pub async fn dashboard(
     Ok(Json(result))
 }
 // Read identity metadata without refreshing tokens or making upstream requests.
-async fn account_email(s: &AppState, id: Uuid) -> xxgate_core::Result<Option<String>> {
+async fn account_identity(
+    s: &AppState,
+    id: Uuid,
+) -> xxgate_core::Result<Option<xxgate_codex::provider::oauth::AccountDetails>> {
     let credentials = s
         .gateway
         .cipher
         .decrypt(id, &s.gateway.store.credentials(id).await?)?;
-    Ok(xxgate_codex::provider::oauth::account_details(&credentials)
-        .ok()
-        .and_then(|d| d.email))
+    Ok(xxgate_codex::provider::oauth::account_details(&credentials).ok())
 }
 
 pub async fn delete_account(
@@ -94,8 +95,8 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
             .account_spending(account.id, now, stale)
             .await?;
         let resets = super::resets::view(&s, account.id).await?;
-        let email = account_email(&s, account.id).await?;
-        items.push(json!({"email":email,"account":account,"quotas":windows,"spending":spending,"resets":resets}));
+        let identity = account_identity(&s, account.id).await?;
+        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":account,"quotas":windows,"spending":spending,"resets":resets}));
     }
     Ok(Json(
         json!({"items":items,"runtime":s.gateway.scheduler.stats()}),
@@ -110,8 +111,9 @@ pub async fn account_detail(
         .scheduler
         .account(id)
         .ok_or_else(Error::not_found)?;
+    let identity = account_identity(&s, id).await?;
     Ok(Json(
-        json!({"email":account_email(&s,id).await?,"account":a,"quotas":s.gateway.store.quotas(id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
+        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":a,"quotas":s.gateway.store.quotas(id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
     ))
 }
 #[derive(Deserialize)]

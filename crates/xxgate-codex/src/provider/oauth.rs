@@ -134,29 +134,114 @@ fn jwt(value: &str) -> Option<Value> {
 pub struct AccountDetails {
     pub account_id: String,
     pub email: Option<String>,
+    pub plan_type: Option<String>,
 }
 pub fn account_details(c: &Credentials) -> Result<AccountDetails> {
     // Claims are used as upstream metadata, never as authorization for the administrator API.
-    for token in [&c.id_token, &c.access_token] {
-        if let Some(value) = jwt(token)
-            && let Some(id) = value
-                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
-                .or_else(|| value.get("chatgpt_account_id"))
-                .and_then(Value::as_str)
-                .filter(|v| !v.is_empty())
-        {
-            return Ok(AccountDetails {
-                account_id: id.into(),
-                email: value
-                    .get("email")
+    let claims: Vec<_> = [&c.id_token, &c.access_token]
+        .into_iter()
+        .filter_map(|token| jwt(token))
+        .collect();
+    let account_id = claims
+        .iter()
+        .find_map(claim_account_id)
+        .ok_or_else(|| Error::invalid("Credential claims do not contain a ChatGPT account ID"))?;
+    let matching: Vec<_> = claims
+        .iter()
+        .filter(|v| claim_account_id(v) == Some(account_id))
+        .collect();
+    Ok(AccountDetails {
+        account_id: account_id.into(),
+        email: matching
+            .iter()
+            .find_map(|v| v.get("email").and_then(Value::as_str).map(str::to_owned)),
+        // A refresh can replace the access token while retaining an older ID token.
+        plan_type: matching
+            .iter()
+            .rev()
+            .find_map(|v| {
+                v.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+                    .or_else(|| v.get("chatgpt_plan_type"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
-            });
+            })
+            .map(str::to_ascii_lowercase)
+            .filter(|p| {
+                matches!(
+                    p.as_str(),
+                    "free" | "plus" | "pro" | "go" | "team" | "business" | "enterprise" | "edu"
+                )
+            }),
+    })
+}
+
+fn claim_account_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .or_else(|| value.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn token(value: Value) -> String {
+        format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(value.to_string())
+        )
+    }
+
+    #[test]
+    fn plan_claims_cover_subscriptions_without_guessing_missing_or_unknown_plans() {
+        for (claim, expected) in [
+            (json!("free"), Some("free")),
+            (json!("plus"), Some("plus")),
+            (json!("Pro"), Some("pro")),
+            (Value::Null, None),
+            (json!("<script>"), None),
+            (json!("future_plan"), None),
+        ] {
+            let c = Credentials {
+                id_token: token(
+                    json!({"email":"a@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"account-a","chatgpt_plan_type":claim}}),
+                ),
+                access_token: "opaque".into(),
+                refresh_token: String::new(),
+                expires_at: None,
+            };
+            let d = account_details(&c).unwrap();
+            assert_eq!(d.plan_type.as_deref(), expected);
+            assert_eq!(d.email.as_deref(), Some("a@example.com"));
         }
     }
-    Err(Error::invalid(
-        "Credential claims do not contain a ChatGPT account ID",
-    ))
+
+    #[test]
+    fn refreshed_plan_uses_matching_access_claims_and_preserves_identity_email() {
+        let mut c = Credentials {
+            id_token: token(
+                json!({"chatgpt_account_id":"a","email":"a@example.com","chatgpt_plan_type":"free"}),
+            ),
+            access_token: token(json!({"chatgpt_account_id":"a","chatgpt_plan_type":"pro"})),
+            refresh_token: String::new(),
+            expires_at: None,
+        };
+        let d = account_details(&c).unwrap();
+        assert_eq!(d.account_id, "a");
+        assert_eq!(d.email.as_deref(), Some("a@example.com"));
+        assert_eq!(d.plan_type.as_deref(), Some("pro"));
+        c.access_token = token(json!({"chatgpt_account_id":"b","chatgpt_plan_type":"plus"}));
+        assert_eq!(
+            account_details(&c).unwrap().plan_type.as_deref(),
+            Some("free")
+        );
+        c.access_token = token(json!({"chatgpt_account_id":"a","chatgpt_plan_type":"future_plan"}));
+        assert_eq!(account_details(&c).unwrap().plan_type, None);
+        c.id_token = "invalid".into();
+        c.access_token = "opaque".into();
+        assert!(account_details(&c).is_err());
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]

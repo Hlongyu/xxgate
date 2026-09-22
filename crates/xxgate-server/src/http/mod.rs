@@ -136,6 +136,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/assets/app.js", get(js))
         .route("/assets/cache-metrics.js", get(cache_metrics_js))
+        .route("/assets/account-quotas.js", get(account_quotas_js))
         .route("/assets/error-center.js", get(error_center_js))
         .route("/assets/app.css", get(css))
         .route("/healthz", get(health))
@@ -206,6 +207,13 @@ async fn cache_metrics_js() -> Response {
     (
         [("content-type", "text/javascript; charset=utf-8")],
         Body::from(include_str!("../../web/cache-metrics.js")),
+    )
+        .into_response()
+}
+async fn account_quotas_js() -> Response {
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        Body::from(include_str!("../../web/account-quotas.js")),
     )
         .into_response()
 }

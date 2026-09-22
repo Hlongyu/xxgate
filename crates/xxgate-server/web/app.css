@@ -175,8 +175,11 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
 .account-email{display:block;margin-top:3px;font-size:12px;color:#526859;overflow-wrap:anywhere}
 .account-row-meta{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px;font-size:10px;color:#7b887d}
 .account-row-meta .group-chip{font-size:10px;padding:2px 5px}
+.account-plan{display:inline-flex;border:1px solid #d4dfd0;border-radius:4px;padding:2px 5px;color:#496644;background:#f3f7ef;font-size:10px;font-weight:600}
+.partial-history{color:#917236;font-size:9px;white-space:nowrap}
 .account-row-heading{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:3px}
-.account-row .amount-chip{padding:2px 0;min-height:20px;min-width:0;background:none;font-size:12px;gap:4px}
+.account-row .amount-chip{padding:2px 0;min-height:20px;min-width:0;max-width:100%;flex-wrap:wrap;background:none;font-size:12px;gap:4px}
+.account-row .partial-history{flex-basis:100%}
 .account-row .amount-chip svg{display:none}
 .account-row .quota{width:100%;min-width:0}
 .account-row .quota-label{margin-bottom:3px;font-size:11px}

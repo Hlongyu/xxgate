@@ -303,9 +303,9 @@ impl ReportStore for PgStore {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         // Preserve current quota-cycle statistics even when request details have
         // a shorter retention. Delete only complete hours from both tables.
-        sqlx::query("DELETE FROM account_spending_entries WHERE finished_at < date_trunc('hour',now()-interval '8 days','UTC')")
+        sqlx::query("DELETE FROM account_spending_entries WHERE finished_at < date_trunc('hour',now()-interval '31 days','UTC')")
             .execute(&mut *tx).await.map_err(|_|Error::storage())?;
-        sqlx::query("DELETE FROM account_spending_hourly WHERE hour < date_trunc('hour',now()-interval '8 days','UTC')")
+        sqlx::query("DELETE FROM account_spending_hourly WHERE hour < date_trunc('hour',now()-interval '31 days','UTC')")
             .execute(&mut *tx).await.map_err(|_|Error::storage())?;
         let requests=sqlx::query("DELETE FROM requests WHERE finished_at IS NOT NULL AND created_at<now()-make_interval(days=>$1)").bind(cfg.request_retention_days as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
         let events=sqlx::query("DELETE FROM audit_events WHERE (request_id IS NOT NULL AND at<now()-make_interval(days=>$1)) OR (request_id IS NULL AND at<now()-make_interval(days=>$2))").bind(cfg.request_retention_days as i32).bind(cfg.audit_retention_days as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
@@ -313,7 +313,7 @@ impl ReportStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| Error::storage())?;
-        sqlx::query("DELETE FROM quota_snapshots WHERE observed_at<now()-make_interval(days=>$1) AND id NOT IN (SELECT max(id) FROM quota_snapshots GROUP BY account_id,pool,window_minutes)").bind(cfg.request_retention_days.max(8) as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?;
+        sqlx::query("DELETE FROM quota_snapshots WHERE observed_at<now()-make_interval(days=>$1) AND id NOT IN (SELECT max(id) FROM quota_snapshots GROUP BY account_id,pool,window_minutes)").bind(cfg.request_retention_days.max(31) as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(
             json!({"config_version":cfg.version,"requests_deleted":requests,"events_deleted":events,"finished_at":Utc::now()}),

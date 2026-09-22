@@ -177,7 +177,15 @@ pub fn weekly_quota_sample(
     windows: &[crate::quota::QuotaWindow],
     now: DateTime<Utc>,
 ) -> Option<(&crate::quota::QuotaWindow, &crate::quota::QuotaWindow)> {
-    let cycle = quota_cycle(windows, 10080, now)?;
+    quota_sample(windows, 10080, now)
+}
+
+pub fn quota_sample(
+    windows: &[crate::quota::QuotaWindow],
+    minutes: i64,
+    now: DateTime<Utc>,
+) -> Option<(&crate::quota::QuotaWindow, &crate::quota::QuotaWindow)> {
+    let cycle = quota_cycle(windows, minutes, now)?;
     (cycle.latest.used_percent - cycle.first.used_percent >= 1.0)
         .then_some((cycle.first, cycle.latest))
 }

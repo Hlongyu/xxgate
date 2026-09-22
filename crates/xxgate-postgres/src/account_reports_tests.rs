@@ -86,6 +86,9 @@ async fn compare_windows(
         .bind(to)
         .bind(now - Duration::hours(5))
         .bind(now - Duration::days(7))
+        .bind(now - Duration::days(30))
+        .bind(from)
+        .bind(to)
         .fetch_all(&store.pool)
         .await
         .unwrap();
@@ -93,7 +96,8 @@ async fn compare_windows(
         let (start, end, main) = match t.label.as_str() {
             "last_5h" => (now - Duration::hours(5), now, false),
             "last_7d" => (now - Duration::days(7), now, false),
-            "weekly" => (from, to, true),
+            "last_30d" => (now - Duration::days(30), now, false),
+            "weekly" | "monthly" => (from, to, true),
             _ => unreachable!(),
         };
         // The pre-migration query is the oracle, including its exact bounds,
@@ -155,6 +159,7 @@ async fn account_rollups_backfill_and_increment_match_exact_windows() {
         now,
         now - Duration::hours(5),
         now - Duration::days(7),
+        now - Duration::days(30),
         hour,
         hour - Duration::hours(3),
     ] {
@@ -202,6 +207,12 @@ async fn account_rollups_backfill_and_increment_match_exact_windows() {
         .unwrap();
     sqlx::raw_sql(include_str!(
         "../migrations/0012_soft_delete_accounts_keys.sql"
+    ))
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0013_monthly_account_spending.sql"
     ))
     .execute(&store.pool)
     .await
@@ -302,7 +313,7 @@ async fn account_rollups_are_atomic_idempotent_and_survive_detail_cleanup() {
     store.finish_request(&r).await.unwrap();
     finish(
         &store,
-        &record(Some(id), now - Duration::days(9), Some("40")),
+        &record(Some(id), now - Duration::days(32), Some("40")),
     )
     .await;
     sqlx::raw_sql("ALTER TABLE quota_snapshots DROP CONSTRAINT quota_snapshots_account_id_fkey")
@@ -547,5 +558,136 @@ async fn account_cycles_survive_dense_sampling_and_reset_independently() {
     assert_eq!(partial_report["last_5h"]["input_tokens"], "1234");
     assert_eq!(partial_report["last_5h"]["output_tokens"], "63");
     assert_eq!(partial_report["last_5h"]["missing_tokens"], 1);
+    teardown(store, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database; run python3 scripts/test.py"]
+async fn monthly_cycles_cover_thirty_days_and_survive_short_request_retention() {
+    let (store, schema) = setup(true).await;
+    sqlx::raw_sql("ALTER TABLE quota_snapshots DROP CONSTRAINT quota_snapshots_account_id_fkey")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    let now = Utc::now().with_nanosecond(123_456_000).unwrap();
+    let start = now - Duration::days(20);
+    let reset = now + Duration::days(10);
+    save_window(&store, id, 43200, start + Duration::hours(1), reset, 5.0).await;
+    save_window(&store, id, 43200, now, reset, 30.0).await;
+    for (at, cny, model) in [
+        (start, Some("999"), "m"),
+        (start + Duration::microseconds(1), Some("2"), "m"),
+        (now - Duration::days(10), Some("3"), "m"),
+        (now - Duration::hours(8), Some("5"), "m"),
+        (now - Duration::hours(7), Some("4"), "gpt-5.3-codex-spark"),
+        (now - Duration::hours(6), None, "m"),
+    ] {
+        let mut r = record(Some(id), at, cny);
+        r.upstream_model = Some(model.into());
+        finish(&store, &r).await;
+    }
+    finish(&store, &record(Some(Uuid::new_v4()), now, Some("999"))).await;
+    let partial = store.spending_report(id, now, 900).await.unwrap();
+    assert_eq!(partial["last_30d"]["cny"], "14");
+    assert_eq!(partial["last_30d"]["requests"], 5);
+    assert_eq!(partial["last_30d"]["input_tokens"], "6170");
+    assert_eq!(partial["last_30d"]["output_tokens"], "280");
+    assert_eq!(partial["last_30d"]["unpriced"], 1);
+    assert_eq!(partial["last_30d"]["history_complete"], false);
+    assert_eq!(
+        partial["monthly_estimate"]["status"],
+        "insufficient_history"
+    );
+    assert_eq!(partial["last_7d"]["cny"], Value::Null);
+    // This fixture has complete old history; an upgrade cannot generally assume it.
+    sqlx::query("UPDATE account_spending_coverage SET complete_since=$1")
+        .bind(now - Duration::days(31))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let complete = store.spending_report(id, now, 900).await.unwrap();
+    assert_eq!(complete["last_30d"]["history_complete"], true);
+    assert_eq!(complete["monthly_estimate"]["sample_cny"], "8");
+    assert_eq!(complete["monthly_estimate"]["used_percent_delta"], 25.0);
+    assert_eq!(complete["monthly_estimate"]["total_cny"], "32");
+    store
+        .cleanup(&RuntimeSettings {
+            request_retention_days: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(complete, store.spending_report(id, now, 900).await.unwrap());
+    let retained: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM quota_snapshots WHERE account_id=$1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, 2);
+    // An independently reset monthly counter must stop including the old segment.
+    save_window(&store, id, 43200, now + Duration::seconds(1), reset, 0.0).await;
+    finish(
+        &store,
+        &record(Some(id), now + Duration::seconds(2), Some("1")),
+    )
+    .await;
+    save_window(&store, id, 43200, now + Duration::seconds(3), reset, 2.0).await;
+    let reset_report = store
+        .spending_report(id, now + Duration::seconds(3), 900)
+        .await
+        .unwrap();
+    assert_eq!(reset_report["last_30d"]["cny"], "1");
+    assert_eq!(reset_report["last_30d"]["requests"], 1);
+    assert_eq!(reset_report["monthly_estimate"]["sample_cny"], "1");
+    assert_eq!(
+        store.spending_report(id, reset, 900).await.unwrap()["last_30d"]["status"],
+        "unknown_cycle"
+    );
+    teardown(store, schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database; run python3 scripts/test.py"]
+async fn monthly_upgrade_backfills_retained_history_without_repricing_existing_ledger() {
+    let (store, schema) = setup(false).await;
+    let now = Utc::now();
+    let id = Uuid::new_v4();
+    let old = record(Some(id), now - Duration::days(20), Some("7"));
+    let current = record(Some(id), now - Duration::days(2), Some("3"));
+    for r in [&old, &current] {
+        insert_historical(&store, r).await;
+    }
+    for sql in [
+        MIGRATION,
+        include_str!("../migrations/0011_account_cycle_tokens.sql"),
+        include_str!("../migrations/0012_soft_delete_accounts_keys.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(&store.pool).await.unwrap();
+    }
+    // A persisted ledger valuation is authoritative even if legacy detail changed.
+    sqlx::query("UPDATE requests SET data=jsonb_set(data,'{valuation,cny}','\"999\"') WHERE id=$1")
+        .bind(current.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0013_monthly_account_spending.sql"
+    ))
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    store.finish_request(&old).await.unwrap();
+    let totals:(String,String,i64)=sqlx::query_as("SELECT sum(cny)::text,sum(input_tokens)::text,sum(requests)::bigint FROM account_spending_hourly WHERE account_id=$1")
+        .bind(id).fetch_one(&store.pool).await.unwrap();
+    assert_eq!(totals, ("10".into(), "2468".into(), 2));
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM account_spending_entries WHERE account_id=$1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
     teardown(store, schema).await;
 }
