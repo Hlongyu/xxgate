@@ -241,7 +241,7 @@ XXGate 接受普通 Responses 客户端，无需来自 Codex。无 session/threa
 
 `GET /api/admin/request-errors` 需要管理员会话，查询参数为 from/to（RFC3339，默认过去 24 小时）、account_id、key_id、model、kind、state、code、stage、upstream_status、upstream_missing、cause、param、session_id、request_id、q、limit（1–100）、offset。q 按字面进行不区分大小写的匹配，不将 SQL 通配符当成模式。所有汇总与明细使用同一数据库快照，响应仅投影页面需要的字段，不携带原始 usage、请求诊断或时间线；账户与 Key 选择项只返回 ID 和名称。
 
-新增请求的上游错误会提取白名单原因、错误码和参数（如不支持 max_output_tokens、加密上下文无效、上下文超限），存入可选 upstream_error。原始错误文本仍仅返回当次调用方，不写入记录；输入、输出、密文和工具参数不持久化。历史记录无法补回未保存的原文，继续展示当时保存的通用说明。迁移 9 新增错误请求的时间索引，旧数据无需改写。
+新增请求的上游错误会提取白名单原因、错误码和参数（如不支持 max_output_tokens、加密上下文无效、上下文超限），存入可选 upstream_error。原始错误文本仍仅返回当次调用方，不写入记录；输入、输出、密文和工具参数不持久化。内容策略拒绝使用 `upstream_content_policy_violation`，网络安全风险提示记录为 `cybersecurity_risk`，后台显示具体原因。Responses 非流式调用返回 HTTP 403，流式调用在失败事件中返回同一错误码与上游说明（已发送的 HTTP 200 响应头不会改写）；这类拒绝不会停用账户。对于带有会话 ID 的请求，网关持久化「网关 Key + 会话 ID」的安全拒绝记录；该会话后续调用返回 HTTP 403 与 `session_safety_blocked`，不再转发，即使更换内容、模型、线程或上游账户也一样。排队请求发送前会复查，已经发往上游的请求无法撤回。不同 Key 或不同会话互不影响，无会话 ID 的请求只返回当次拒绝。此判断不读取或比较正文，不生成内容指纹；记录不随请求历史清理或服务重启失效。历史记录无法补回未保存的原文，继续展示当时保存的通用说明。迁移 9 新增错误请求的时间索引，旧数据无需改写。
 
 ## 许可证
 

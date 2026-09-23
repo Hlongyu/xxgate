@@ -153,9 +153,55 @@ impl ProviderAdapter for CodexProvider {
     }
 }
 
+// Keep only a bounded classification in persistence. Upstream prose may quote
+// request content and remains transient, visible only to the requesting client.
+fn content_policy_reason(value: &serde_json::Value) -> Option<&'static str> {
+    let message = upstream_message(value).unwrap_or("");
+    if message.starts_with("This content was flagged for possible cybersecurity risk.") {
+        return Some("cybersecurity_risk");
+    }
+    let code = value
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| value.get("code").and_then(serde_json::Value::as_str));
+    match code {
+        Some("cyber_policy") => Some("cybersecurity_risk"),
+        Some("content_policy_violation" | "content_filter" | "content_policy_error") => {
+            Some("content_policy_violation")
+        }
+        _ => None,
+    }
+}
+
+fn upstream_message(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("detail").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+}
+
 pub(crate) fn classify_error(status: u16, body: &[u8]) -> (Error, Option<DisableReason>) {
     let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
-    let (error, disable) = classify_parsed_error(status, parsed.as_ref());
+    let (error, disable) = if let Some(reason) = parsed.as_ref().and_then(content_policy_reason) {
+        let message = if reason == "cybersecurity_risk" {
+            "The upstream rejected this request because its content was flagged for possible cybersecurity risk"
+        } else {
+            "The upstream rejected this request under its content safety policy"
+        };
+        (
+            Error::new(403, "upstream_content_policy_violation", message)
+                .with_client_message(parsed.as_ref().and_then(upstream_message)),
+            None,
+        )
+    } else {
+        classify_parsed_error(status, parsed.as_ref())
+    };
     (error.with_upstream(error_facts(parsed.as_ref())), disable)
 }
 
@@ -270,6 +316,10 @@ fn error_facts(value: Option<&serde_json::Value>) -> Option<xxgate_core::types::
                 "token_revoked",
                 "account_deactivated",
                 "server_error",
+                "content_policy_violation",
+                "content_policy_error",
+                "content_filter",
+                "cyber_policy",
             ]
             .contains(code)
         });
@@ -314,7 +364,9 @@ fn error_facts(value: Option<&serde_json::Value>) -> Option<xxgate_core::types::
             ]
             .contains(param)
         });
-    let reason = if message == "Our servers are currently overloaded. Please try again later." {
+    let reason = if let Some(reason) = content_policy_reason(value) {
+        Some(reason)
+    } else if message == "Our servers are currently overloaded. Please try again later." {
         Some("upstream_overloaded")
     } else if code == Some("invalid_encrypted_content")
         && message == "Encrypted function output content could not be decrypted or decoded."
@@ -346,6 +398,45 @@ fn error_facts(value: Option<&serde_json::Value>) -> Option<xxgate_core::types::
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn policy_rejections_are_non_transient_and_safe_to_persist() {
+        let message =
+            "This content was flagged for possible cybersecurity risk. PRIVATE_REQUEST_CONTENT";
+        for body in [
+            json!({"error":{"code":"upstream_error","message":message}}),
+            json!({"code":"policy_rejected","message":message}),
+            json!({"detail":message}),
+        ] {
+            for status in [400, 403, 502] {
+                let (error, disable) = classify_error(status, &serde_json::to_vec(&body).unwrap());
+                assert_eq!(error.status, 403);
+                assert_eq!(error.code, "upstream_content_policy_violation");
+                assert_eq!(error.client_message(), message);
+                assert_eq!(
+                    error.upstream.as_ref().unwrap().reason.as_deref(),
+                    Some("cybersecurity_risk")
+                );
+                assert!(disable.is_none());
+                assert!(!serde_json::to_string(&error).unwrap().contains("PRIVATE_"));
+            }
+        }
+        for code in [
+            "content_policy_violation",
+            "content_filter",
+            "content_policy_error",
+        ] {
+            let (error, _) = classify_error(
+                400,
+                &serde_json::to_vec(&json!({"error":{"code":code,"message":"PRIVATE_DETAIL"}}))
+                    .unwrap(),
+            );
+            assert_eq!(error.code, "upstream_content_policy_violation");
+            assert_eq!(error.upstream.as_ref().unwrap().code.as_deref(), Some(code));
+        }
+        let (error, _) = classify_error(502, br#"{"error":{"code":"server_error","message":"Unrelated failure mentioning cybersecurity risk"}}"#);
+        assert_eq!(error.code, "upstream_error");
+    }
 
     #[test]
     fn upstream_facts_preserve_known_causes_without_free_text() {

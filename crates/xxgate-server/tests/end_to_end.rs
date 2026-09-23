@@ -1,3 +1,6 @@
+#[path = "support/content_policy.rs"]
+mod content_policy_contract;
+
 #[path = "support/client_sources.rs"]
 mod client_sources_contract;
 
@@ -304,6 +307,9 @@ async fn upstream(
         }
     }
     let behavior = body["instructions"].as_str().unwrap_or("normal").to_owned();
+    if let Some(response) = content_policy_contract::upstream(&behavior) {
+        return response;
+    }
     if let Some(response) = stream_recovery_contract::upstream(&mock, &body, &behavior) {
         return response;
     }
@@ -1302,6 +1308,8 @@ async fn real_http_postgres_gateway_contract() {
     let routed_record_id = model_routing_contract::verify(&c).await;
     session_concurrency_contract::verify(&c, &gateway, &mock, a, b).await;
     encrypted_reasoning_recovery_contract::verify(&c, &gateway, &mock).await;
+    content_policy_contract::verify(&c, &mock).await;
+    content_policy_contract::verify_sessions(&c, &gateway, &mock).await;
     stream_recovery_contract::verify(&c, &gateway, &mock).await;
     turn_state_contract::verify(&c, &mock).await;
 

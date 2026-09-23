@@ -1,8 +1,8 @@
 'use strict';
 const ErrorCenter=(()=>{
- const stages={authentication:'鉴权',body_encoding:'请求编码',body_read:'读取请求体',json_parse:'JSON 解析',ingress_validation:'接入校验',admission:'准入与排队',queue_or_prepare:'排队与准备',upstream_transport:'上游连接',upstream_response:'上游响应',process:'进程中断'};
- const codes={memory_limit:'内存预算不足',request_too_large:'请求体过大',upstream_invalid_request:'上游拒绝参数或上下文',upstream_not_found:'上游接口或模型不存在',upstream_error:'上游执行失败',upstream_idle_timeout:'上游响应超时',upstream_headers_timeout:'上游响应头超时',upstream_rate_limited:'上游限流',upstream_quota_exhausted:'上游额度耗尽',oauth_invalid:'账户授权失效',invalid_api_key:'网关 Key 无效',invalid_request:'请求格式无效',client_cancelled:'客户端断开',process_interrupted:'进程退出中断请求',stream_interrupted:'上游流中断',queue_timeout:'排队超时',gateway_shutdown:'网关关闭'};
- const causes={upstream_overloaded:'上游服务过载',invalid_encrypted_tool_output:'加密工具输出无效',unsupported_parameter:'不支持参数',invalid_encrypted_content:'加密上下文无效',context_length_exceeded:'上下文超限',rate_limit_exceeded:'上游限流'};
+ const stages={safety_policy:'网关安全拦截',authentication:'鉴权',body_encoding:'请求编码',body_read:'读取请求体',json_parse:'JSON 解析',ingress_validation:'接入校验',admission:'准入与排队',queue_or_prepare:'排队与准备',upstream_transport:'上游连接',upstream_response:'上游响应',process:'进程中断'};
+ const codes={session_safety_blocked:'会话已因上游安全拒绝而拦截',memory_limit:'内存预算不足',request_too_large:'请求体过大',upstream_invalid_request:'上游拒绝参数或上下文',upstream_not_found:'上游接口或模型不存在',upstream_error:'上游执行失败',upstream_content_policy_violation:'上游内容策略拒绝',upstream_idle_timeout:'上游响应超时',upstream_headers_timeout:'上游响应头超时',upstream_rate_limited:'上游限流',upstream_quota_exhausted:'上游额度耗尽',oauth_invalid:'账户授权失效',invalid_api_key:'网关 Key 无效',invalid_request:'请求格式无效',client_cancelled:'客户端断开',process_interrupted:'进程退出中断请求',stream_interrupted:'上游流中断',queue_timeout:'排队超时',gateway_shutdown:'网关关闭'};
+ const causes={cybersecurity_risk:'网络安全风险拦截',content_policy_violation:'内容安全策略拦截',upstream_overloaded:'上游服务过载',invalid_encrypted_tool_output:'加密工具输出无效',unsupported_parameter:'不支持参数',invalid_encrypted_content:'加密上下文无效',context_length_exceeded:'上下文超限',rate_limit_exceeded:'上游限流'};
  function cause(f){if(!f)return '';return [causes[f.reason]||f.reason||f.code,f.param].filter(Boolean).join(' · ');}
  function stage(s){return stages[s]||s||'未知阶段';}
  function title(code){return codes[code]||label(code);}
@@ -16,7 +16,7 @@ const ErrorCenter=(()=>{
  function clearGroup(){state.errorGroup=null;state.errorOffset=0;}
  function refresh(){state.errorWindow=null;state.errorOffset=0;}
  function groupParams(g){return {code:g.code,stage:g.stage,cause:g.cause||'',param:g.param||'',...(g.upstream_status==null?{upstream_missing:'true'}:{upstream_status:g.upstream_status})};}
- function status(r){return r.upstream_status==null?'未收到上游响应':`${r.upstream_status}${r.upstream_status>=200&&r.upstream_status<300?' · 响应处理失败':''}`;}
+ function status(r){return r.upstream_status==null?'未收到上游响应':`${r.upstream_status}${r.upstream_status>=200&&r.upstream_status<300?' · 请求失败':''}`;}
  function trend(d){
   const bucket=(d.bucket_seconds||3600)*1000,from=Date.parse(d.from),to=Date.parse(d.to),start=Math.floor(from/bucket)*bucket,counts=new Map(d.trend.map(p=>[Date.parse(p.at),Number(p.count)]));
   const bars=[];for(let at=start;at<to;at+=bucket)bars.push({at,count:counts.get(at)||0});

@@ -57,6 +57,9 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
         Ok(response) => response,
         Err(error) => {
             let version = state.gateway.settings.current().version;
+            if error.0.code == "session_safety_blocked" {
+                context.stage = "safety_policy";
+            }
             context.diagnostics["failure_stage"] = json!(context.stage);
             context.diagnostics["body_bytes"] = json!(context.bytes);
             context.diagnostics["error"] =

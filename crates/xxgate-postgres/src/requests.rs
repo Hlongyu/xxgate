@@ -15,6 +15,30 @@ use xxgate_core::{
 
 #[async_trait]
 impl RequestStore for PgStore {
+    async fn safety_rejection(
+        &self,
+        session: &xxgate_core::identity::SessionKey,
+    ) -> Result<Option<Error>> {
+        sqlx::query("SELECT data FROM safety_rejections WHERE key_id=$1 AND session_id=$2")
+            .bind(session.key_id)
+            .bind(&session.client_session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| Error::storage())?
+            .as_ref()
+            .map(decode)
+            .transpose()
+    }
+    async fn save_safety_rejection(
+        &self,
+        session: &xxgate_core::identity::SessionKey,
+        error: &Error,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO safety_rejections(key_id,session_id,data) VALUES($1,$2,$3) ON CONFLICT(key_id,session_id) DO NOTHING")
+            .bind(session.key_id).bind(&session.client_session_id).bind(encode(error)?)
+            .execute(&self.pool).await.map_err(|_| Error::storage())?;
+        Ok(())
+    }
     async fn begin_request(&self, r: &RequestRecord) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         sqlx::query("INSERT INTO requests(id,key_id,account_id,client_session_id,model,state,created_at,data) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")

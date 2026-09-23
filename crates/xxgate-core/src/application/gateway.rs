@@ -48,6 +48,7 @@ pub struct Gateway {
     pub completed: AtomicU64,
     pub failed: AtomicU64,
     pub mutations: Mutex<()>,
+    pub(crate) safety: super::safety::SafetyGuard,
     refresh_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     pub(crate) model_sync_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     pub(crate) reset_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
@@ -74,6 +75,7 @@ struct Execution {
     terminal_delivered: bool,
     unary: Option<Value>,
     raw_body: Option<Bytes>,
+    safety_rejection: Option<Error>,
 }
 
 impl Gateway {
@@ -107,6 +109,7 @@ impl Gateway {
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             mutations: Mutex::new(()),
+            safety: Default::default(),
             refresh_locks: Mutex::new(HashMap::new()),
             model_sync_locks: Mutex::new(HashMap::new()),
             reset_locks: Mutex::new(HashMap::new()),
@@ -135,6 +138,17 @@ impl Gateway {
                 )
             })?;
         self.provider.validate(&request, &model)?;
+        let safety_session = (!request.stateless).then(|| SessionKey {
+            key_id: key.id,
+            client_session_id: request.identity.session_id.clone(),
+        });
+        if let Some(session) = &safety_session {
+            self.safety.check(session)?;
+            if let Some(error) = self.store.safety_rejection(session).await? {
+                self.safety.remember(session.clone(), error.clone());
+                return Err(super::safety::blocked(error));
+            }
+        }
         let since = Instant::now();
         let ticket = self.scheduler.enqueue(
             id,
@@ -210,7 +224,7 @@ impl Gateway {
         self.tasks.spawn(async move {
             let _memory = memory;
             let cancel = this.shutdown.child_token();
-            let mut execution = Execution { response_headers: http::HeaderMap::new(), ticket: Some(ticket), record, price: None, finalized: false, terminal_delivered: false, unary: None, raw_body: None };
+            let mut execution = Execution { response_headers: http::HeaderMap::new(), ticket: Some(ticket), record, price: None, finalized: false, terminal_delivered: false, unary: None, raw_body: None, safety_rejection: None };
             let result = tokio::select! {
                 biased;
                 _ = tx.closed() => { cancel.cancel(); Err(Error::cancelled()) },
@@ -219,6 +233,13 @@ impl Gateway {
             };
             cancel.cancel();
             let error = result.err();
+            if let Some(session) = &safety_session
+                && let Some(rejection) = execution.safety_rejection.as_ref()
+                && let Err(save_error) = this.store.save_safety_rejection(session, rejection).await
+            {
+                this.scheduler.set_paused(true);
+                tracing::error!(request_id=%id,code=%save_error.code,"safety rejection persistence failed; dispatch paused");
+            }
             this.note_config(&mut execution,this.settings.current().version);
             if !execution.finalized {
                 if let Err(e) = this.finalize(&mut execution, error.as_ref(), since).await {
@@ -244,6 +265,29 @@ impl Gateway {
             bytes: rx,
             completion: done_rx,
         })
+    }
+
+    fn check_session_safety(&self, e: &Execution) -> Result<()> {
+        if !e.record.stateless {
+            self.safety.check(&SessionKey {
+                key_id: e.record.key_id,
+                client_session_id: e.record.client_session_id.clone(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn observe_safety_rejection(&self, e: &mut Execution, error: &Error) {
+        if error.code == "upstream_content_policy_violation" && !e.record.stateless {
+            self.safety.remember(
+                SessionKey {
+                    key_id: e.record.key_id,
+                    client_session_id: e.record.client_session_id.clone(),
+                },
+                error.clone(),
+            );
+            e.safety_rejection = Some(error.clone());
+        }
     }
 
     async fn wait_for_account(
@@ -306,6 +350,7 @@ impl Gateway {
             let mut lease = self
                 .wait_for_account(request, model, e, tx, cancel, since)
                 .await?;
+            self.check_session_safety(e)?;
             if request.stateless {
                 lease.confirm_stateless()?;
             } else if lease.needs_commit {
@@ -421,10 +466,16 @@ impl Gateway {
         self.store.append_event(&AuditEvent::new("dispatched", "gateway", Some(e.record.id), e.record.account_id, json!({"group_id":lease.binding.group_id,"binding_id":e.record.binding_id,"generation":e.record.binding_generation,"stateless":request.stateless,"queue_ms":e.record.queue_ms,"client_profile_version":lease.account.version,"codex_version":lease.account.profile.codex_version}))).await?;
         let started = Instant::now();
         let mut cfg = self.settings.subscribe();
+        let mut sent_attempts = 0;
         'attempt: loop {
             if cancel.is_cancelled() || tx.is_closed() {
                 return Err(Error::cancelled());
             }
+            if let Err(error) = self.check_session_safety(e) {
+                e.record.upstream_attempts = sent_attempts;
+                return Err(error);
+            }
+            sent_attempts += 1;
             let attempt_started = Instant::now();
             let sending = self.transport.send_once(prepared.clone(), cancel.clone());
             tokio::pin!(sending);
@@ -492,6 +543,7 @@ impl Gateway {
                     continue 'attempt;
                 }
                 let (error, disable) = self.provider.http_error(response.status, &body);
+                self.observe_safety_rejection(e, &error);
                 if request.kind == RequestKind::Search {
                     let mut memory = self.memory.lease();
                     memory.resize(body.len())?;
@@ -555,6 +607,13 @@ impl Gateway {
                     &mut ids,
                     self.settings.current().sse_event_limit_bytes,
                 )?;
+                // Latch safety decisions before any await or downstream delivery:
+                // cancellation must not discard an already observed rejection.
+                for event in &events {
+                    if let Some(error) = &event.observation.error {
+                        self.observe_safety_rejection(e, error);
+                    }
+                }
                 if !events.is_empty() {
                     last_event = Instant::now();
                     e.record
@@ -815,7 +874,9 @@ impl Gateway {
         e.record.upstream_error = error.and_then(|v| v.upstream.clone());
         if let Some(error) = error {
             if let Some(diagnostics) = e.record.ingress_diagnostics.as_mut() {
-                diagnostics["failure_stage"] = json!(if e.record.upstream_status.is_some() {
+                diagnostics["failure_stage"] = json!(if error.code == "session_safety_blocked" {
+                    "safety_policy"
+                } else if e.record.upstream_status.is_some() {
                     "upstream_response"
                 } else if e.record.upstream_attempts > 0 {
                     "upstream_transport"
