@@ -32,7 +32,7 @@ pub async fn dashboard(
     Ok(Json(result))
 }
 // Read identity metadata without refreshing tokens or making upstream requests.
-async fn account_identity(
+pub(super) async fn account_identity(
     s: &AppState,
     id: Uuid,
 ) -> xxgate_core::Result<Option<xxgate_codex::provider::oauth::AccountDetails>> {

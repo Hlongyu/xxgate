@@ -95,6 +95,7 @@ pub fn response(body: &[u8]) -> Result<Vec<DiscoveredModel>> {
                 id: id.into(),
                 display_name,
                 context_window,
+                raw: Some(model.clone()),
             },
         );
     }
@@ -131,11 +132,18 @@ mod tests {
         assert_eq!(account.profile.codex_version, "0.153.4");
     }
     #[test]
-    fn decodes_codex_catalog_without_persisting_prompts_or_descriptions() {
+    fn preserves_complete_upstream_capabilities() {
         let models=response(br#"{"models":[{"slug":"gpt-test","display_name":"Test","context_window":200000,"description":"PRIVATE_TEXT","base_instructions":"PRIVATE_PROMPT"},{"slug":"gpt-test","display_name":"Test","context_window":200000}]}"#).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].context_window, Some(200000));
-        assert!(!serde_json::to_string(&models).unwrap().contains("PRIVATE"));
+        let original = serde_json::json!({"slug":"test","display_name":"Test","base_instructions":"instructions","unknown":{"nested":[1,null,true]},"service_tiers":[]});
+        let decoded = response(
+            serde_json::json!({"models":[original.clone()]})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(decoded[0].raw.as_ref(), Some(&original));
         assert!(response(br#"{"error":"denied"}"#).is_err());
         assert!(response(br#"{"models":[{}]}"#).is_err());
         assert!(response(br#"{"models":[]}"#).unwrap().is_empty());

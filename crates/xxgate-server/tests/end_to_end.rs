@@ -258,7 +258,7 @@ async fn upstream_models(
     } else {
         "only-b"
     };
-    Json(json!({"models":[{"slug":"mock-upstream","display_name":"Shared model"},{"slug":only,"display_name":only}]})).into_response()
+    Json(json!({"models":[{"slug":"mock-upstream","display_name":"Shared model","future_capability":{"source":only},"service_tiers":[],"base_instructions":"model instructions"},{"slug":only,"display_name":only}]})).into_response()
 }
 fn frame(v: Value) -> Bytes {
     Bytes::from(format!("data: {v}\n\n"))
@@ -723,7 +723,7 @@ async fn real_http_postgres_gateway_contract() {
     let mut account_ids = vec![];
     for name in ["A", "B"] {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        let claims = URL_SAFE_NO_PAD.encode(json!({"email":format!("{name}@example.com"),"chatgpt_account_id":format!("mock-account-{name}"),"chatgpt_plan_type":if name=="A" {Some("free")} else {None}}).to_string());
+        let claims = URL_SAFE_NO_PAD.encode(json!({"email":format!("{name}@example.com"),"chatgpt_account_id":format!("mock-account-{name}"),"chatgpt_plan_type":if name=="A" {"free"} else {"pro"}}).to_string());
         let id_token = format!("header.{claims}.PRIVATE_ID_SIGNATURE");
         let a=c.admin("/accounts","POST",Some(json!({"name":name,"upstream_account_id":format!("mock-account-{name}"),"upstream_base_url":upstream_url,"max_inflight":1,"credentials":{"access_token":format!("PRIVATE_ACCESS_TOKEN_{name}"),"id_token":id_token,"refresh_token":"","expires_at":null}}))).await;
         assert_eq!(a["enabled"], false);
@@ -742,7 +742,7 @@ async fn real_http_postgres_gateway_contract() {
         let plan = if email == "A@example.com" {
             json!("free")
         } else {
-            Value::Null
+            json!("pro")
         };
         assert_eq!(item["plan_type"], plan);
         let detail = c.admin(&format!("/accounts/{id}"), "GET", None).await;
@@ -852,6 +852,55 @@ async fn real_http_postgres_gateway_contract() {
             .any(|m| m["id"] == "unavailable-manual-model")
     );
     c.enabled(a, true).await;
+    c.enabled(b, true).await;
+    // Full objects survive DB persistence and aliasing; Pro wins over Free.
+    for path in ["/models", "/v1/models"] {
+        let listed = c
+            .http
+            .get(format!("{}{path}", c.base))
+            .bearer_auth(&c.key)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let capability = listed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == "mock-model")
+            .unwrap();
+        assert_eq!(
+            capability,
+            &json!({"slug":"mock-model","display_name":"Shared model","future_capability":{"source":"only-b"},"service_tiers":[],"base_instructions":"model instructions"})
+        );
+        assert!(
+            !listed["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["slug"] == "unavailable-manual-model")
+        );
+    }
+    c.enabled(b, false).await;
+    let listed = c
+        .http
+        .get(format!("{}/models", c.base))
+        .bearer_auth(&c.key)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let capability = listed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "mock-model")
+        .unwrap();
+    assert_eq!(capability["future_capability"]["source"], "only-a");
     let mut cfg = c.admin("/settings", "GET", None).await;
     cfg["heartbeat_interval_ms"] = json!(50);
     cfg["queue_timeout_ms"] = json!(5000);

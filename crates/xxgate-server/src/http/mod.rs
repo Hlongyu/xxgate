@@ -5,6 +5,7 @@ mod groups;
 mod oauth;
 mod oauth_browser;
 mod public;
+mod public_models;
 mod resets;
 
 use axum::{

@@ -34,9 +34,15 @@ pub async fn models(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
                     .scheduler
                     .supports_group_model(key.group_id, &m.upstream, source)
         })
-        .map(|m| json!({"id":m.id,"object":"model","owned_by":"xxgate"}))
         .collect::<Vec<_>>();
-    Ok(Json(json!({"object":"list","data":models})))
+    let capabilities = super::public_models::catalog(&state, key.group_id, source, &models).await?;
+    let data: Vec<_> = models
+        .iter()
+        .map(|m| json!({"id":m.id,"object":"model","owned_by":"xxgate"}))
+        .collect();
+    Ok(Json(
+        json!({"object":"list","data":data,"models":capabilities}),
+    ))
 }
 pub async fn responses(State(state): State<AppState>, request: Request) -> Response {
     handle(state, request, RequestKind::Responses).await

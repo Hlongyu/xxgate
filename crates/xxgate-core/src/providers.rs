@@ -7,6 +7,10 @@ pub struct DiscoveredModel {
     pub id: String,
     pub display_name: String,
     pub context_window: Option<i64>,
+    /// Complete upstream capability object. Older catalogs have no raw object
+    /// until their next successful sync; do not fabricate missing capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
