@@ -19,6 +19,7 @@ futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,7 +34,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-reqwest.workspace = true
 tower.workspace = true
 
 [lints]

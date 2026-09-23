@@ -9,3 +9,5 @@ mod resets;
 mod settings;
 
 pub use accounts::PgStore;
+
+mod model_version;

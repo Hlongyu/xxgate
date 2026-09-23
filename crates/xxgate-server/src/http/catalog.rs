@@ -93,6 +93,6 @@ pub async fn discovered(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     }
     accounts.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(
-        json!({"items":models.into_values().collect::<Vec<_>>(),"accounts":accounts}),
+        json!({"items":models.into_values().collect::<Vec<_>>(),"accounts":accounts,"client_version":xxgate_codex::model_version::current()}),
     ))
 }

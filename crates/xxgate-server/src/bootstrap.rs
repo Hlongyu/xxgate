@@ -45,8 +45,9 @@ pub async fn run() -> anyhow::Result<()> {
         store.initialize_admin(&hash_password(&password)?).await?;
     }
     let interrupted = store.reconcile_interrupted().await?;
+    crate::model_version::restore(&store).await?;
     let gateway = Gateway::new(
-        store,
+        store.clone(),
         CredentialCipher::new(&key),
         Arc::new(ResponsesIngress),
         Arc::new(CodexProvider),
@@ -64,6 +65,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
     let state = AppState::new(gateway.clone(), allow_http, secure_cookies);
+    crate::model_version::start(gateway.clone(), store)?;
     crate::workers::start(state.clone());
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, interrupted, "XXGate started");

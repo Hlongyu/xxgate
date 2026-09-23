@@ -10,6 +10,26 @@ use xxgate_core::{
 };
 
 pub fn request(account: &Account, credentials: &Credentials) -> Result<PreparedRequest> {
+    request_with_version(account, credentials, &crate::model_version::current())
+}
+
+fn request_with_version(
+    account: &Account,
+    credentials: &Credentials,
+    version: &str,
+) -> Result<PreparedRequest> {
+    let mut account = account.clone();
+    account.profile.user_agent = account.profile.user_agent.replace(
+        &format!("codex_cli_rs/{}", account.profile.codex_version),
+        &format!("codex_cli_rs/{version}"),
+    );
+    account.profile.codex_version = version.into();
+    let mut headers = super::request::auth_headers(&account, credentials)?;
+    headers.insert(
+        "version",
+        http::HeaderValue::from_str(version)
+            .map_err(|_| Error::invalid("Invalid models client version"))?,
+    );
     let mut url = url::Url::parse(&format!(
         "{}/models",
         account.upstream_base_url.trim_end_matches('/')
@@ -20,7 +40,7 @@ pub fn request(account: &Account, credentials: &Credentials) -> Result<PreparedR
     Ok(PreparedRequest {
         method: Method::GET,
         url: url.into(),
-        headers: super::request::auth_headers(account, credentials)?,
+        headers,
         body: Bytes::new(),
         account_id: Some(account.id),
         profile_version: account.version,
@@ -83,6 +103,33 @@ pub fn response(body: &[u8]) -> Result<Vec<DiscoveredModel>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discovery_version_updates_query_and_headers_without_changing_account() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "name":"test", "provider":"openai",
+            "access_kind":"codex_oauth", "enabled":true, "disable_reason":null,
+            "max_inflight":1, "upstream_account_id":"account-id",
+            "upstream_base_url":"https://chatgpt.com/backend-api/codex",
+            "models":[], "profile":xxgate_core::accounts::ClientProfile::default(),
+            "version":1,"credential_version":1,"credential_expires_at":null,
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let credentials: Credentials =
+            serde_json::from_value(serde_json::json!({"access_token":"test","expires_at":null}))
+                .unwrap();
+        let request = request_with_version(&account, &credentials, "0.155.1").unwrap();
+        assert!(request.url.ends_with("/models?client_version=0.155.1"));
+        assert_eq!(request.headers["version"], "0.155.1");
+        assert!(
+            request.headers["user-agent"]
+                .to_str()
+                .unwrap()
+                .starts_with("codex_cli_rs/0.155.1 ")
+        );
+        assert_eq!(request.headers["chatgpt-account-id"], "account-id");
+        assert_eq!(account.profile.codex_version, "0.153.4");
+    }
     #[test]
     fn decodes_codex_catalog_without_persisting_prompts_or_descriptions() {
         let models=response(br#"{"models":[{"slug":"gpt-test","display_name":"Test","context_window":200000,"description":"PRIVATE_TEXT","base_instructions":"PRIVATE_PROMPT"},{"slug":"gpt-test","display_name":"Test","context_window":200000}]}"#).unwrap();
