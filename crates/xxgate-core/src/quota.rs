@@ -30,9 +30,18 @@ mod tests {
 
     #[test]
     fn quota_windows_map_to_the_three_cooldowns() {
-        assert_eq!(window(300, 100.0, None).disable_reason(), Some(DisableReason::Quota5hExhausted));
-        assert_eq!(window(10080, 100.0, None).disable_reason(), Some(DisableReason::Quota7dExhausted));
-        assert_eq!(window(43200, 100.0, None).disable_reason(), Some(DisableReason::QuotaExhausted));
+        assert_eq!(
+            window(300, 100.0, None).disable_reason(),
+            Some(DisableReason::Quota5hExhausted)
+        );
+        assert_eq!(
+            window(10080, 100.0, None).disable_reason(),
+            Some(DisableReason::Quota7dExhausted)
+        );
+        assert_eq!(
+            window(43200, 100.0, None).disable_reason(),
+            Some(DisableReason::QuotaExhausted)
+        );
     }
 
     #[test]
@@ -57,8 +66,7 @@ impl QuotaWindow {
 
     /// Whether this exhausted window is still inside its cooldown period.
     pub fn cooldown_active(&self, now: DateTime<Utc>) -> bool {
-        self.disable_reason().is_some_and(|_| {
-            self.resets_at.is_none_or(|reset| reset > now)
-        })
+        self.disable_reason()
+            .is_some_and(|_| self.resets_at.is_none_or(|reset| reset > now))
     }
 }

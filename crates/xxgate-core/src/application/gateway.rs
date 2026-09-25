@@ -1002,9 +1002,11 @@ impl Gateway {
         for account in accounts.into_iter().filter(|a| {
             matches!(
                 a.disable_reason,
-                Some(DisableReason::Quota5hExhausted
-                    | DisableReason::Quota7dExhausted
-                    | DisableReason::QuotaExhausted)
+                Some(
+                    DisableReason::Quota5hExhausted
+                        | DisableReason::Quota7dExhausted
+                        | DisableReason::QuotaExhausted
+                )
             ) && !a.enabled
         }) {
             let windows = self.store.quotas(account.id).await?;
