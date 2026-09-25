@@ -12,6 +12,25 @@ pub struct QuotaWindow {
     pub source: String,
 }
 
+impl QuotaWindow {
+    pub fn disable_reason(&self) -> Option<DisableReason> {
+        if !self.used_percent.is_finite() || self.used_percent < 100.0 {
+            return None;
+        }
+        Some(match self.window_minutes {
+            Some(300) => DisableReason::Quota5hExhausted,
+            Some(10080) => DisableReason::Quota7dExhausted,
+            _ => DisableReason::QuotaExhausted,
+        })
+    }
+
+    /// Whether this exhausted window is still inside its cooldown period.
+    pub fn cooldown_active(&self, now: DateTime<Utc>) -> bool {
+        self.disable_reason()
+            .is_some_and(|_| self.resets_at.is_none_or(|reset| reset > now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,24 +68,5 @@ mod tests {
         let now = Utc::now();
         assert!(window(300, 100.0, Some(now + Duration::minutes(1))).cooldown_active(now));
         assert!(!window(300, 100.0, Some(now - Duration::minutes(1))).cooldown_active(now));
-    }
-}
-
-impl QuotaWindow {
-    pub fn disable_reason(&self) -> Option<DisableReason> {
-        if !self.used_percent.is_finite() || self.used_percent < 100.0 {
-            return None;
-        }
-        Some(match self.window_minutes {
-            Some(300) => DisableReason::Quota5hExhausted,
-            Some(10080) => DisableReason::Quota7dExhausted,
-            _ => DisableReason::QuotaExhausted,
-        })
-    }
-
-    /// Whether this exhausted window is still inside its cooldown period.
-    pub fn cooldown_active(&self, now: DateTime<Utc>) -> bool {
-        self.disable_reason()
-            .is_some_and(|_| self.resets_at.is_none_or(|reset| reset > now))
     }
 }
