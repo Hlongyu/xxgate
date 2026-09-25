@@ -32,7 +32,24 @@ pub fn start(state: AppState) {
                 }
             });
             tokio::select! {_=quotas.gateway.shutdown.cancelled()=>break,_=polls=>{}}
+            if let Err(error) = quotas.gateway.reenable_expired_quotas().await {
+                tracing::warn!(code=%error.code,"quota cooldown re-enable failed");
+            }
             last = Instant::now();
+        }
+    });
+    let cooldowns = state.clone();
+    state.gateway.tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                _ = cooldowns.gateway.shutdown.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = cooldowns.gateway.reenable_expired_quotas().await {
+                        tracing::warn!(code=%error.code,"quota cooldown re-enable failed");
+                    }
+                }
+            }
         }
     });
     let cleanup = state.clone();

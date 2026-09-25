@@ -993,6 +993,33 @@ impl Gateway {
         }
         Ok(())
     }
+
+    /// Re-enable accounts whose exhausted quota windows have all cooled down.
+    /// Administrator and OAuth disables are intentionally left untouched.
+    pub async fn reenable_expired_quotas(&self) -> Result<()> {
+        let now = Utc::now();
+        let accounts = self.scheduler.accounts();
+        for account in accounts.into_iter().filter(|a| {
+            matches!(
+                a.disable_reason,
+                Some(DisableReason::Quota5hExhausted
+                    | DisableReason::Quota7dExhausted
+                    | DisableReason::QuotaExhausted)
+            ) && !a.enabled
+        }) {
+            let windows = self.store.quotas(account.id).await?;
+            if windows.is_empty() {
+                continue;
+            }
+            // Any still-exhausted window keeps the account disabled. This also
+            // handles a shorter window expiring while a longer one remains full.
+            if windows.iter().any(|window| window.cooldown_active(now)) {
+                continue;
+            }
+            self.set_enabled(account.id, true, None, "upstream").await?;
+        }
+        Ok(())
+    }
     pub async fn credentials(&self, id: Uuid, force: bool) -> Result<Credentials> {
         let lock = self
             .refresh_locks
