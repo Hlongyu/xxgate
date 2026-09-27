@@ -102,19 +102,13 @@ impl State {
                     "A conversation cannot migrate across providers or access types",
                 ));
             }
-            if let Some(a) = self
-                .accounts
-                .get(&binding.account_id)
-                .filter(|a| a.enabled && a.group_ids.contains(&group_id) && a.accepts(source))
-                && !self.blocked.contains(&a.id)
+            if let Some(a) = self.accounts.get(&binding.account_id).filter(|a| {
+                a.enabled
+                    && a.group_ids.contains(&group_id)
+                    && a.accepts(source)
+                    && a.supports(model)
+            }) && !self.blocked.contains(&a.id)
             {
-                if !a.supports(model) {
-                    return Err(Error::new(
-                        409,
-                        "bound_account_model_unsupported",
-                        "The bound account does not support this model",
-                    ));
-                }
                 return Ok(());
             }
         }
@@ -391,11 +385,10 @@ impl Scheduler {
                             a.enabled
                                 && a.group_ids.contains(&waiter.group_id)
                                 && a.accepts(waiter.source)
+                                && a.supports(&waiter.model)
                         });
                     let account = if let Some(a) = bound {
-                        (a.supports(&waiter.model)
-                            && s.inflight.get(&a.id).copied().unwrap_or(0) < a.max_inflight)
-                            .then_some(a)
+                        (s.inflight.get(&a.id).copied().unwrap_or(0) < a.max_inflight).then_some(a)
                     } else {
                         s.accounts
                             .values()
@@ -1025,6 +1018,202 @@ mod tests {
         let next = s.try_reserve(te.id).unwrap().unwrap();
         assert_eq!(next.binding.generation, 3);
         assert_eq!(next.binding.group_id, k.group_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_switch_migrates_only_after_all_old_threads_and_binding_commit() {
+        let mut a = account();
+        a.models = vec!["test".into()];
+        a.max_inflight = 10;
+        let mut b = account();
+        b.models = vec!["other".into()];
+        b.max_inflight = 10;
+        let k = key(DEFAULT_GROUP_ID);
+        let binding = Binding::new(session(&k, "s"), a.id, &ModelRef::codex("test"), 7);
+        let s = Scheduler::new(
+            LiveSettings::new(RuntimeSettings {
+                session_max_inflight: 3,
+                ..Default::default()
+            }),
+            vec![a.clone(), b.clone()],
+            vec![binding.clone()],
+            vec![k.clone()],
+        );
+        let first = s
+            .try_reserve(enqueue_thread(&s, &k, "s", "a").unwrap().id)
+            .unwrap()
+            .unwrap();
+        first.begin_send().unwrap();
+        let second = s
+            .try_reserve(enqueue_thread(&s, &k, "s", "b").unwrap().id)
+            .unwrap()
+            .unwrap();
+        second.begin_send().unwrap();
+        let next = |thread: &str| {
+            s.enqueue(
+                Uuid::new_v4(),
+                ThreadKey {
+                    session: session(&k, "s"),
+                    client_thread_id: thread.into(),
+                },
+                k.group_id,
+                ModelRef::codex("other"),
+                ClientSource::Unknown,
+                Instant::now(),
+            )
+            .unwrap()
+        };
+        let third = next("c");
+        let fourth = next("d");
+        assert!(s.try_reserve(third.id).unwrap().is_none());
+        drop(first);
+        assert!(s.try_reserve(third.id).unwrap().is_none());
+        drop(second);
+        let mut migrated = s.try_reserve(third.id).unwrap().unwrap();
+        assert_eq!(migrated.account.id, b.id);
+        assert_eq!(migrated.expected_generation, 7);
+        assert_eq!(migrated.binding.generation, 8);
+        assert_ne!(migrated.binding.namespace, binding.namespace);
+        assert!(s.try_reserve(fourth.id).unwrap().is_none());
+        migrated.confirm_binding();
+        migrated.begin_send().unwrap();
+        let parallel = s.try_reserve(fourth.id).unwrap().unwrap();
+        assert_eq!(parallel.binding.id, migrated.binding.id);
+        assert!(!parallel.needs_commit);
+        parallel.begin_send().unwrap();
+        // A request for the old model must also drain the new generation first.
+        let back = enqueue_thread(&s, &k, "s", "back").unwrap();
+        assert!(s.try_reserve(back.id).unwrap().is_none());
+        drop((migrated, parallel));
+        let returned = s.try_reserve(back.id).unwrap().unwrap();
+        assert_eq!(returned.account.id, a.id);
+        assert_eq!(returned.binding.generation, 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_model_restriction_or_catalog_change_reselects_without_capacity_failover() {
+        for catalog_changed in [false, true] {
+            let mut a = account();
+            let b = account();
+            let k = key(DEFAULT_GROUP_ID);
+            let binding = Binding::new(session(&k, "s"), a.id, &ModelRef::codex("test"), 1);
+            let s = Scheduler::new(
+                LiveSettings::new(RuntimeSettings::default()),
+                vec![a.clone(), b.clone()],
+                vec![binding],
+                vec![k.clone()],
+            );
+            let held = enqueue_thread(&s, &k, "s", "held").unwrap();
+            let first = s.try_reserve(held.id).unwrap().unwrap();
+            first.begin_send().unwrap();
+            let waiting = enqueue_thread(&s, &k, "s", "next").unwrap();
+            // Both accounts support test: saturation alone must retain affinity.
+            assert!(s.try_reserve(waiting.id).unwrap().is_none());
+            if catalog_changed {
+                a.model_catalog = Some(crate::providers::AccountModelCatalog {
+                    synced_at: Some(chrono::Utc::now()),
+                    ..Default::default()
+                });
+            } else {
+                a.models_restricted = true;
+                a.models = vec!["luna".into()];
+            }
+            s.update_account(a.clone());
+            assert!(s.try_reserve(waiting.id).unwrap().is_none());
+            drop(first);
+            let mut next = s.try_reserve(waiting.id).unwrap().unwrap();
+            assert_eq!(next.account.id, b.id);
+            assert_eq!(next.binding.generation, 2);
+            next.confirm_binding();
+            next.begin_send().unwrap();
+            drop(next);
+            // Restart from the persisted binding preserves the migrated account.
+            let saved =
+                s.0.state
+                    .lock()
+                    .unwrap()
+                    .bindings
+                    .values()
+                    .cloned()
+                    .collect();
+            let restored = Scheduler::new(
+                LiveSettings::new(RuntimeSettings::default()),
+                vec![a, b.clone()],
+                saved,
+                vec![k.clone()],
+            );
+            let ticket = enqueue(&restored, &k, "s").unwrap();
+            let lease = restored.try_reserve(ticket.id).unwrap().unwrap();
+            assert_eq!(lease.account.id, b.id);
+            assert_eq!(lease.binding.generation, 2);
+            assert!(!lease.needs_commit);
+        }
+    }
+
+    #[test]
+    fn incompatible_bound_model_respects_group_source_and_provider_boundaries() {
+        let mut a = account();
+        a.models = vec!["luna".into()];
+        let mut b = account();
+        let k = key(DEFAULT_GROUP_ID);
+        let binding = Binding::new(session(&k, "s"), a.id, &ModelRef::codex("luna"), 1);
+        let s = Scheduler::new(
+            LiveSettings::new(RuntimeSettings::default()),
+            vec![a, b.clone()],
+            vec![binding],
+            vec![k.clone()],
+        );
+        for change in 0..4 {
+            b.enabled = change != 0;
+            b.group_ids = if change == 1 {
+                vec![Uuid::new_v4()]
+            } else {
+                vec![DEFAULT_GROUP_ID]
+            };
+            b.codex_only = change == 2;
+            b.models_restricted = change == 3;
+            b.models = vec![];
+            s.update_account(b.clone());
+            assert_eq!(
+                enqueue(&s, &k, "s").err().unwrap().code,
+                if change == 2 {
+                    "client_source_not_allowed"
+                } else {
+                    "no_available_account"
+                }
+            );
+            assert_eq!(s.stats().queued, 0);
+        }
+        b.models_restricted = false;
+        s.update_account(b);
+        for model in [
+            ModelRef {
+                provider: "other".into(),
+                ..ModelRef::codex("test")
+            },
+            ModelRef {
+                access_kind: "api_key".into(),
+                ..ModelRef::codex("test")
+            },
+        ] {
+            assert_eq!(
+                s.enqueue(
+                    Uuid::new_v4(),
+                    ThreadKey {
+                        session: session(&k, "s"),
+                        client_thread_id: "t".into()
+                    },
+                    k.group_id,
+                    model,
+                    ClientSource::Unknown,
+                    Instant::now()
+                )
+                .err()
+                .unwrap()
+                .code,
+                "provider_mismatch"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

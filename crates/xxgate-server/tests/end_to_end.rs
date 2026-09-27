@@ -19,6 +19,9 @@ mod model_routing_contract;
 #[path = "support/session_concurrency.rs"]
 mod session_concurrency_contract;
 
+#[path = "support/model_migration.rs"]
+mod model_migration_contract;
+
 #[path = "support/encrypted_reasoning_recovery.rs"]
 mod encrypted_reasoning_recovery_contract;
 
@@ -1356,6 +1359,7 @@ async fn real_http_postgres_gateway_contract() {
     compaction_contract::verify(&c, &gateway, &mock, a, b).await;
     let routed_record_id = model_routing_contract::verify(&c).await;
     session_concurrency_contract::verify(&c, &gateway, &mock, a, b).await;
+    model_migration_contract::verify(&c, &gateway, &mock, a, b).await;
     encrypted_reasoning_recovery_contract::verify(&c, &gateway, &mock).await;
     content_policy_contract::verify(&c, &mock).await;
     content_policy_contract::verify_sessions(&c, &gateway, &mock).await;
