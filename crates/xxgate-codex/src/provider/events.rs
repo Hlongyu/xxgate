@@ -96,6 +96,19 @@ impl ProviderDecoder for CodexDecoder {
                     observation.encrypted_rejection = super::recovery::rejection(body);
                 }
             }
+            if kind == "codex.rate_limits"
+                && value.get("credits").is_some()
+                && ["metered_limit_name", "limit_id", "limit_name"]
+                    .iter()
+                    .all(|key| {
+                        value
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .is_none_or(|s| s == "codex")
+                    })
+            {
+                observation.extra_credits = Some(super::quota::credits(&value, "rate_limit_event"));
+            }
             if kind == "response.output_item.done" && value["item"]["type"] == "compaction" {
                 self.compaction_output = true;
             }
@@ -402,6 +415,40 @@ mod tests {
             assert_eq!(observation.response_model.as_deref(), model);
         }
     }
+    #[test]
+    fn credit_events_update_only_the_codex_balance() {
+        let mut ids = IdentityMap::new(
+            Binding::new(
+                SessionKey {
+                    key_id: Uuid::new_v4(),
+                    client_session_id: "credits".into(),
+                },
+                Uuid::new_v4(),
+                &ModelRef::codex("m"),
+                1,
+            ),
+            vec![],
+        );
+        for (pool, expected) in [("codex", true), ("codex_other", false)] {
+            let value = json!({"type":"codex.rate_limits","metered_limit_name":pool,
+                "credits":{"has_credits":true,"unlimited":false,"balance":"7.5"}});
+            let events = CodexDecoder::default()
+                .push(format!("data: {value}\n\n").as_bytes(), &mut ids, 4096)
+                .unwrap();
+            assert_eq!(events[0].observation.extra_credits.is_some(), expected);
+            if expected {
+                assert!(
+                    events[0]
+                        .observation
+                        .extra_credits
+                        .as_ref()
+                        .unwrap()
+                        .available(chrono::Utc::now(), 300)
+                );
+            }
+        }
+    }
+
     #[test]
     fn cumulative_usage_is_replaced_and_events_preserve_response_ids() {
         let mut decoder = CodexDecoder::default();

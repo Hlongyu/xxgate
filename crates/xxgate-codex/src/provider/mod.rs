@@ -119,6 +119,7 @@ impl ProviderAdapter for CodexProvider {
     fn headers(&self, headers: &HeaderMap) -> Observation {
         Observation {
             quotas: quota::headers(headers),
+            extra_credits: quota::credit_headers(headers),
             ..Observation::default()
         }
     }
@@ -147,6 +148,9 @@ impl ProviderAdapter for CodexProvider {
         credentials: &Credentials,
     ) -> Result<PreparedRequest> {
         quota::request(account, credentials)
+    }
+    fn extra_credits_response(&self, body: &[u8]) -> Result<xxgate_core::quota::ExtraCredits> {
+        quota::credit_response(body)
     }
     fn quota_response(&self, body: &[u8]) -> Result<Vec<QuotaWindow>> {
         quota::response(body)

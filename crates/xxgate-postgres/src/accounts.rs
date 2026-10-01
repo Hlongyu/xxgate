@@ -175,7 +175,7 @@ impl AccountStore for PgStore {
                 .await
                 .map_err(|_| Error::storage())?;
         }
-        event_tx(&mut tx, &AuditEvent::new(if expected_version.is_some() { "account_updated" } else { "account_created" }, "admin", None, Some(account.id), json!({"version":account.version,"name":account.name,"enabled":account.enabled,"codex_only":account.codex_only,"max_inflight":account.max_inflight,"group_ids":account.group_ids}))).await?;
+        event_tx(&mut tx, &AuditEvent::new(if expected_version.is_some() { "account_updated" } else { "account_created" }, "admin", None, Some(account.id), json!({"version":account.version,"name":account.name,"enabled":account.enabled,"codex_only":account.codex_only,"use_extra_credits":account.use_extra_credits,"max_inflight":account.max_inflight,"group_ids":account.group_ids}))).await?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(account)
     }
@@ -265,6 +265,26 @@ impl AccountStore for PgStore {
         .await?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(a)
+    }
+    async fn extra_credits(&self, id: Uuid) -> Result<Option<xxgate_core::quota::ExtraCredits>> {
+        sqlx::query("SELECT data FROM account_extra_credits WHERE account_id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| Error::storage())?
+            .as_ref()
+            .map(decode)
+            .transpose()
+    }
+    async fn save_extra_credits(
+        &self,
+        id: Uuid,
+        credits: &xxgate_core::quota::ExtraCredits,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO account_extra_credits(account_id,observed_at,data) VALUES($1,$2,$3) ON CONFLICT(account_id) DO UPDATE SET observed_at=EXCLUDED.observed_at,data=EXCLUDED.data WHERE account_extra_credits.observed_at<=EXCLUDED.observed_at")
+            .bind(id).bind(credits.observed_at).bind(encode(credits)?)
+            .execute(&self.pool).await.map_err(|_| Error::storage())?;
+        Ok(())
     }
     async fn save_quotas(&self, id: Uuid, windows: &[QuotaWindow]) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;

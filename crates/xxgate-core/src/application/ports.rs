@@ -42,6 +42,12 @@ pub trait AccountStore: Send + Sync {
         expected_version: i64,
         actor: &str,
     ) -> Result<Account>;
+    async fn extra_credits(&self, id: Uuid) -> Result<Option<crate::quota::ExtraCredits>>;
+    async fn save_extra_credits(
+        &self,
+        id: Uuid,
+        credits: &crate::quota::ExtraCredits,
+    ) -> Result<()>;
     async fn save_quotas(&self, id: Uuid, windows: &[QuotaWindow]) -> Result<()>;
     async fn quotas(&self, id: Uuid) -> Result<Vec<QuotaWindow>>;
     async fn save_model_catalog(

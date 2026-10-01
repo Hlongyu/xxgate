@@ -15,6 +15,15 @@
   const m=periods(plan,quotas,spending).at(-1)?.minutes;
   return m?{minutes:m,label:windowLabel(m),value:m===43200?spending?.monthly_estimate:spending?.weekly_estimate}:null;
  }
- const api={planLabel,windowLabel,periods,estimate};
+ function creditLabel(view){
+  const c=view?.snapshot;
+  if(!c||c.has_credits==null&&c.unlimited!==true)return '额外额度未知';
+  const balance=c.balance!=null?` · ${c.balance} credits`:'';
+  if(c.blocked)return '额外额度受限'+balance;
+  if(c.unlimited)return '额外额度不限量';
+  const positive=c.balance==null||Number.isFinite(Number(c.balance))&&Number(c.balance)>0;
+  return c.has_credits&&positive?'额外额度可用'+balance:'额外额度不可用'+balance;
+ }
+ const api={planLabel,windowLabel,periods,estimate,creditLabel};
  if(typeof module==='object'&&module.exports)module.exports=api;else root.AccountQuotas=api;
 })(typeof globalThis==='undefined'?this:globalThis);

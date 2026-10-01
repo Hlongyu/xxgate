@@ -96,7 +96,7 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
             .await?;
         let resets = super::resets::view(&s, account.id).await?;
         let identity = account_identity(&s, account.id).await?;
-        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":account,"quotas":windows,"spending":spending,"resets":resets}));
+        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":account,"quotas":windows,"extra_credits":extra_credits_view(&s, account.id).await?,"spending":spending,"resets":resets}));
     }
     Ok(Json(
         json!({"items":items,"runtime":s.gateway.scheduler.stats()}),
@@ -113,7 +113,7 @@ pub async fn account_detail(
         .ok_or_else(Error::not_found)?;
     let identity = account_identity(&s, id).await?;
     Ok(Json(
-        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":a,"quotas":s.gateway.store.quotas(id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
+        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":a,"quotas":s.gateway.store.quotas(id).await?,"extra_credits":extra_credits_view(&s,id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
     ))
 }
 #[derive(Deserialize)]
@@ -121,6 +121,8 @@ pub async fn account_detail(
 pub struct CreateAccount {
     #[serde(default)]
     codex_only: bool,
+    #[serde(default)]
+    use_extra_credits: bool,
     name: String,
     #[serde(default = "xxgate_core::groups::default_group_ids")]
     group_ids: Vec<Uuid>,
@@ -149,6 +151,7 @@ pub async fn create_account(
         access_kind: "codex_oauth".into(),
         enabled: false,
         codex_only: input.codex_only,
+        use_extra_credits: input.use_extra_credits,
         disable_reason: Some(DisableReason::AdminDisabled),
         max_inflight: input
             .max_inflight
@@ -197,6 +200,7 @@ pub async fn create_account(
 #[serde(deny_unknown_fields)]
 pub struct AccountUpdate {
     codex_only: Option<bool>,
+    use_extra_credits: Option<bool>,
     version: i64,
     group_ids: Option<Vec<Uuid>>,
     name: String,
@@ -224,6 +228,12 @@ pub async fn update_account(
     if let Some(codex_only) = input.codex_only {
         a.codex_only = codex_only;
     }
+    let credit_policy_changed = input
+        .use_extra_credits
+        .is_some_and(|v| v != a.use_extra_credits);
+    if let Some(use_extra_credits) = input.use_extra_credits {
+        a.use_extra_credits = use_extra_credits;
+    }
     a.name = input.name;
     a.max_inflight = input.max_inflight;
     a.models = input.models;
@@ -248,7 +258,16 @@ pub async fn update_account(
     {
         Ok(a) => {
             s.gateway.scheduler.update_account(a.clone());
-            Ok(Json(a))
+            drop(_lock);
+            if credit_policy_changed {
+                s.gateway.reconcile_account_quotas(id).await?;
+            }
+            Ok(Json(
+                s.gateway
+                    .scheduler
+                    .account(id)
+                    .ok_or_else(Error::not_found)?,
+            ))
         }
         Err(e) => {
             if let Ok(accounts) = s.gateway.store.accounts().await {
@@ -289,11 +308,27 @@ pub async fn refresh_account(
     s.gateway.credentials(id, true).await?;
     Ok(Json(json!({"account":s.gateway.scheduler.account(id)})))
 }
+async fn extra_credits_view(s: &AppState, id: Uuid) -> xxgate_core::Result<Value> {
+    let snapshot = s.gateway.store.extra_credits(id).await?;
+    let now = Utc::now();
+    let stale_after = s.gateway.settings.current().quota_stale_after_secs;
+    let stale = snapshot.as_ref().is_none_or(|c| {
+        let age = (now - c.observed_at).num_seconds();
+        age < 0 || age as u64 > stale_after
+    });
+    let available = snapshot
+        .as_ref()
+        .is_some_and(|c| c.available(now, stale_after));
+    Ok(json!({"snapshot":snapshot,"stale":stale,"available":available}))
+}
 pub async fn refresh_quota(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({"quotas":s.gateway.collect_quotas(id).await?})))
+    let windows = s.gateway.collect_quotas(id).await?;
+    Ok(Json(
+        json!({"quotas":windows,"extra_credits":extra_credits_view(&s,id).await?}),
+    ))
 }
 pub async fn keys(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({"items":s.gateway.store.keys().await?})))

@@ -511,10 +511,12 @@ impl Gateway {
                 ))
                 .await?;
             let header_observation = self.provider.headers(&response.headers);
-            self.apply_quotas(
+            self.apply_quota_observation(
                 lease.account.id,
                 lease.account.version,
                 &header_observation.quotas,
+                header_observation.extra_credits.as_ref(),
+                false,
             )
             .await?;
             if !(200..300).contains(&response.status) {
@@ -671,10 +673,12 @@ impl Gateway {
                     if let Some(usage) = event.observation.usage {
                         e.record.usage = usage;
                     }
-                    self.apply_quotas(
+                    self.apply_quota_observation(
                         lease.account.id,
                         lease.account.version,
                         &event.observation.quotas,
+                        event.observation.extra_credits.as_ref(),
+                        false,
                     )
                     .await?;
                     if let Some(reason) = event.observation.disable_reason {
@@ -962,6 +966,18 @@ impl Gateway {
         if !current.enabled || current.version != version {
             return Ok(());
         }
+        if matches!(
+            reason,
+            DisableReason::Quota5hExhausted
+                | DisableReason::Quota7dExhausted
+                | DisableReason::QuotaExhausted
+        ) && let Some(mut credits) = self.store.extra_credits(id).await?
+        {
+            credits.blocked = true;
+            credits.observed_at = Utc::now();
+            credits.source = "upstream_rejection".into();
+            self.store.save_extra_credits(id, &credits).await?;
+        }
         self.scheduler.block_account(id);
         match self
             .store
@@ -984,41 +1000,101 @@ impl Gateway {
         version: i64,
         windows: &[crate::quota::QuotaWindow],
     ) -> Result<()> {
-        if windows.is_empty() {
+        self.apply_quota_observation(id, version, windows, None, false)
+            .await
+    }
+
+    pub async fn apply_quota_observation(
+        &self,
+        id: Uuid,
+        version: i64,
+        windows: &[crate::quota::QuotaWindow],
+        credits: Option<&crate::quota::ExtraCredits>,
+        allow_reenable: bool,
+    ) -> Result<()> {
+        if windows.is_empty() && credits.is_none() {
+            return Ok(());
+        }
+        let _lock = self.mutations.lock().await;
+        let account = self.scheduler.account(id).ok_or_else(Error::not_found)?;
+        // Late responses must not undo an administrator's policy change.
+        if account.version != version {
             return Ok(());
         }
         self.store.save_quotas(id, windows).await?;
-        if let Some(reason) = windows.iter().find_map(|w| w.disable_reason()) {
-            self.disable_observed(id, version, reason).await?;
+        if let Some(credits) = credits {
+            self.store.save_extra_credits(id, credits).await?;
         }
-        Ok(())
+        let reenable = allow_reenable && account.use_extra_credits;
+        self.reconcile_quota_locked(account, reenable).await
     }
 
-    /// Re-enable accounts whose exhausted quota windows have all cooled down.
-    /// Administrator and OAuth disables are intentionally left untouched.
-    pub async fn reenable_expired_quotas(&self) -> Result<()> {
+    pub async fn reconcile_account_quotas(&self, id: Uuid) -> Result<()> {
+        let _lock = self.mutations.lock().await;
+        let account = self.scheduler.account(id).ok_or_else(Error::not_found)?;
+        self.reconcile_quota_locked(account, true).await
+    }
+
+    // Caller holds mutations so a concurrent manual disable cannot be reversed.
+    async fn reconcile_quota_locked(
+        &self,
+        account: crate::accounts::Account,
+        allow_reenable: bool,
+    ) -> Result<()> {
+        let quota_disabled = matches!(
+            account.disable_reason,
+            Some(
+                DisableReason::Quota5hExhausted
+                    | DisableReason::Quota7dExhausted
+                    | DisableReason::QuotaExhausted
+            )
+        );
+        if !account.enabled && (!allow_reenable || !quota_disabled) {
+            return Ok(());
+        }
+        let windows = self.store.quotas(account.id).await?;
+        if windows.is_empty() {
+            return Ok(());
+        }
         let now = Utc::now();
-        let accounts = self.scheduler.accounts();
-        for account in accounts.into_iter().filter(|a| {
-            matches!(
-                a.disable_reason,
-                Some(
-                    DisableReason::Quota5hExhausted
-                        | DisableReason::Quota7dExhausted
-                        | DisableReason::QuotaExhausted
-                )
-            ) && !a.enabled
-        }) {
-            let windows = self.store.quotas(account.id).await?;
-            if windows.is_empty() {
+        let extra = account.use_extra_credits
+            && self
+                .store
+                .extra_credits(account.id)
+                .await?
+                .is_some_and(|c| c.available(now, self.settings.current().quota_stale_after_secs));
+        let reason = windows
+            .iter()
+            .find(|w| crate::quota::quota_blocked(w, extra, now))
+            .and_then(|w| w.disable_reason());
+        let enabled = reason.is_none();
+        if enabled == account.enabled {
+            return Ok(());
+        }
+        self.scheduler.block_account(account.id);
+        match self
+            .store
+            .set_enabled(account.id, enabled, reason, account.version, "upstream")
+            .await
+        {
+            Ok(updated) => {
+                self.scheduler.update_account(updated);
+                Ok(())
+            }
+            Err(error) => {
+                self.scheduler.set_paused(true);
+                Err(error)
+            }
+        }
+    }
+
+    /// Reconcile expired windows and credit freshness without reviving manual/OAuth disables.
+    pub async fn reenable_expired_quotas(&self) -> Result<()> {
+        for account in self.scheduler.accounts() {
+            if account.enabled && !account.use_extra_credits {
                 continue;
             }
-            // Any still-exhausted window keeps the account disabled. This also
-            // handles a shorter window expiring while a longer one remains full.
-            if windows.iter().any(|window| window.cooldown_active(now)) {
-                continue;
-            }
-            self.set_enabled(account.id, true, None, "upstream").await?;
+            self.reconcile_account_quotas(account.id).await?;
         }
         Ok(())
     }
@@ -1109,7 +1185,9 @@ impl Gateway {
                 return Err(error);
             }
             let windows = self.provider.quota_response(&body)?;
-            self.apply_quotas(id, account.version, &windows).await?;
+            let credits = self.provider.extra_credits_response(&body)?;
+            self.apply_quota_observation(id, account.version, &windows, Some(&credits), true)
+                .await?;
             Ok(windows)
         })
         .await

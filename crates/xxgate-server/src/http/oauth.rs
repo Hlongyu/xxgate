@@ -232,6 +232,7 @@ pub(super) async fn save_credentials(
             access_kind: "codex_oauth".into(),
             enabled: false,
             codex_only: false,
+            use_extra_credits: false,
             disable_reason: Some(DisableReason::AdminDisabled),
             max_inflight: s.gateway.settings.current().default_account_concurrency,
             upstream_account_id: details.account_id,

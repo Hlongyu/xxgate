@@ -150,9 +150,105 @@ pub(crate) fn windows(value: &Value, source: &str) -> Vec<QuotaWindow> {
     result
 }
 
+pub(crate) fn credits(value: &Value, source: &str) -> xxgate_core::quota::ExtraCredits {
+    let c = &value["credits"];
+    xxgate_core::quota::ExtraCredits {
+        has_credits: c["has_credits"].as_bool(),
+        unlimited: c["unlimited"].as_bool(),
+        balance: c["balance"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| c["balance"].as_number().map(ToString::to_string)),
+        observed_at: Utc::now(),
+        source: source.into(),
+        blocked: value["spend_control"]["reached"] == true
+            || value["rate_limit_reached_type"]["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("workspace_")),
+    }
+}
+
+pub(crate) fn credit_response(body: &[u8]) -> Result<xxgate_core::quota::ExtraCredits> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| {
+        Error::new(
+            502,
+            "invalid_quota_response",
+            "Upstream quota response is invalid",
+        )
+    })?;
+    // A successful full query with missing credits replaces the old snapshot
+    // with unknown, rather than allowing an old positive balance indefinitely.
+    Ok(credits(&value, "usage_query"))
+}
+
+pub(crate) fn credit_headers(h: &HeaderMap) -> Option<xxgate_core::quota::ExtraCredits> {
+    let get = |name| h.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+    if !h.contains_key("x-codex-credits-has-credits")
+        && !h.contains_key("x-codex-credits-unlimited")
+        && !h.contains_key("x-codex-credits-balance")
+    {
+        return None;
+    }
+    let boolean = |name| {
+        get(name).and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        })
+    };
+    Some(xxgate_core::quota::ExtraCredits {
+        has_credits: boolean("x-codex-credits-has-credits"),
+        unlimited: boolean("x-codex-credits-unlimited"),
+        balance: get("x-codex-credits-balance")
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        observed_at: Utc::now(),
+        source: "response_header".into(),
+        blocked: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credit_queries_headers_and_missing_fields() {
+        let c = credit_response(
+            br#"{"credits":{"has_credits":true,"unlimited":false,"balance":"12.5"}}"#,
+        )
+        .unwrap();
+        assert!(c.available(Utc::now(), 300));
+        assert_eq!(c.balance.as_deref(), Some("12.5"));
+        assert!(
+            !credit_response(br#"{}"#)
+                .unwrap()
+                .available(Utc::now(), 300)
+        );
+        assert!(credit_response(b"invalid").is_err());
+        let c =
+            credit_response(br#"{"credits":{"has_credits":true,"unlimited":false,"balance":0}}"#)
+                .unwrap();
+        assert!(!c.available(Utc::now(), 300));
+        let c = credit_response(br#"{"credits":{"has_credits":true,"unlimited":true},"spend_control":{"reached":true}}"#).unwrap();
+        assert!(!c.available(Utc::now(), 300));
+        let mut h = HeaderMap::new();
+        assert!(credit_headers(&h).is_none());
+        for (name, value) in [
+            ("x-codex-credits-has-credits", "true"),
+            ("x-codex-credits-unlimited", "false"),
+            ("x-codex-credits-balance", "3.25"),
+        ] {
+            h.insert(name, value.parse().unwrap());
+        }
+        assert!(credit_headers(&h).unwrap().available(Utc::now(), 300));
+        h.insert("x-codex-credits-balance", "0".parse().unwrap());
+        assert!(!credit_headers(&h).unwrap().available(Utc::now(), 300));
+        h.insert("x-codex-credits-has-credits", "garbage".parse().unwrap());
+        assert!(!credit_headers(&h).unwrap().available(Utc::now(), 300));
+    }
 
     #[test]
     fn free_thirty_day_window_matches_usage_and_headers_and_can_disable() {

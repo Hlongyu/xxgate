@@ -20,3 +20,14 @@ test('missing metadata and separate pools do not fabricate a quota or a Free pla
  assert.equal(q.periods('free',[],{}).length,1);assert.equal(q.periods('free',[],{})[0].period,undefined);
  assert.equal(q.estimate(null,[],{}),null);assert.equal(q.windowLabel(43200),'30days');assert.equal(q.windowLabel(0),'未知');
 });
+
+test('extra credits distinguish unknown, unavailable, limited and unlimited balances',()=>{
+ const {creditLabel}=require('../account-quotas.js');
+ assert.equal(creditLabel(null),'额外额度未知');
+ assert.equal(creditLabel({snapshot:{has_credits:null,unlimited:null}}),'额外额度未知');
+ assert.equal(creditLabel({snapshot:{has_credits:false,unlimited:false,balance:'0'}}),'额外额度不可用 · 0 credits');
+ assert.equal(creditLabel({snapshot:{has_credits:true,unlimited:false,balance:'25.5'}}),'额外额度可用 · 25.5 credits');
+ assert.equal(creditLabel({snapshot:{has_credits:false,unlimited:true}}),'额外额度不限量');
+ assert.equal(creditLabel({snapshot:{has_credits:true,unlimited:false,balance:'0'}}),'额外额度不可用 · 0 credits');
+ assert.equal(creditLabel({snapshot:{has_credits:true,blocked:true,balance:'25.5'}}),'额外额度受限 · 25.5 credits');
+});

@@ -789,6 +789,7 @@ mod tests {
             access_kind: "codex_oauth".into(),
             enabled: true,
             codex_only: false,
+            use_extra_credits: false,
             disable_reason: None,
             max_inflight: 1,
             upstream_account_id: "upstream".into(),

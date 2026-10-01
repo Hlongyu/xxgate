@@ -1,3 +1,6 @@
+#[path = "support/extra_credits.rs"]
+mod extra_credits_contract;
+
 #[path = "support/content_policy.rs"]
 mod content_policy_contract;
 
@@ -145,6 +148,7 @@ struct Mock {
     release: Arc<Semaphore>,
     models_fail: Arc<std::sync::atomic::AtomicBool>,
     resets: Arc<Mutex<ResetMock>>,
+    quota_payload: Arc<Mutex<Option<Value>>>,
     search: Arc<Mutex<search_contract::SearchMock>>,
     search_release: Arc<Semaphore>,
     compact: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
@@ -541,11 +545,29 @@ async fn real_http_postgres_gateway_contract() {
         release: Arc::new(Semaphore::new(0)),
         models_fail: Default::default(),
         resets: Arc::new(Mutex::new(ResetMock::new())),
+        quota_payload: Default::default(),
         search: Default::default(),
         search_release: Arc::new(Semaphore::new(0)),
         compact: Default::default(),
     };
-    let (upstream_url,upstream_task)=serve(Router::new().route("/responses",post(upstream)).route("/responses/compact",post(compaction_contract::upstream_compact)).route("/alpha/search",post(search_contract::upstream_search)).route("/models",get(upstream_models)).route("/wham/rate-limit-reset-credits",get(reset_list)).route("/wham/rate-limit-reset-credits/consume",post(reset_consume)).route("/wham/usage",get(||async{Json(json!({"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000},"secondary_window":{"used_percent":25,"limit_window_seconds":604800}}}))})).with_state(mock.clone())).await;
+    let (upstream_url, upstream_task) = serve(
+        Router::new()
+            .route("/responses", post(upstream))
+            .route(
+                "/responses/compact",
+                post(compaction_contract::upstream_compact),
+            )
+            .route("/alpha/search", post(search_contract::upstream_search))
+            .route("/models", get(upstream_models))
+            .route("/wham/rate-limit-reset-credits", get(reset_list))
+            .route(
+                "/wham/rate-limit-reset-credits/consume",
+                post(reset_consume),
+            )
+            .route("/wham/usage", get(extra_credits_contract::usage))
+            .with_state(mock.clone()),
+    )
+    .await;
     let browser_calls = Arc::new(AtomicUsize::new(0));
     let counted_browser = browser_calls.clone();
     let gateway = Gateway::new(
@@ -1365,6 +1387,8 @@ async fn real_http_postgres_gateway_contract() {
     content_policy_contract::verify_sessions(&c, &gateway, &mock).await;
     stream_recovery_contract::verify(&c, &gateway, &mock).await;
     turn_state_contract::verify(&c, &mock).await;
+
+    extra_credits_contract::verify(&c, &gateway, &mock, a).await;
 
     // Quota exhaustion is sticky until the administrator explicitly reenables the account.
     let id = Uuid::parse_str(a).unwrap();

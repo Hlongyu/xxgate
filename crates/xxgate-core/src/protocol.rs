@@ -121,6 +121,7 @@ pub struct Observation {
     pub compaction_output: Option<bool>,
     pub usage: Option<Usage>,
     pub quotas: Vec<QuotaWindow>,
+    pub extra_credits: Option<crate::quota::ExtraCredits>,
     pub terminal: bool,
     pub error: Option<Error>,
     pub disable_reason: Option<DisableReason>,
@@ -197,6 +198,7 @@ pub trait ProviderAdapter: Send + Sync {
         credentials: &Credentials,
     ) -> Result<PreparedRequest>;
     fn quota_response(&self, body: &[u8]) -> Result<Vec<QuotaWindow>>;
+    fn extra_credits_response(&self, body: &[u8]) -> Result<crate::quota::ExtraCredits>;
     fn reset_credits_request(
         &self,
         account: &Account,
