@@ -174,7 +174,13 @@ impl ProviderDecoder for CodexDecoder {
                     let bytes = serde_json::to_vec(body).map_err(|_| {
                         Error::new(502, "invalid_upstream_event", "Invalid error event")
                     })?;
-                    let (error, reason) = super::classify_error(502, &bytes);
+                    let (mut error, reason) = super::classify_error(502, &bytes);
+                    if let Some(original) =
+                        error.upstream.as_mut().and_then(|e| e.original.as_mut())
+                    {
+                        original.source = "sse".into();
+                        original.fields["event_type"] = kind.clone().into();
+                    }
                     observation.error = Some(error.clone());
                     observation.disable_reason = reason;
                     if kind == "error" {

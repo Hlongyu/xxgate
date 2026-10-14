@@ -59,6 +59,8 @@ impl PgStore {
                     RequestKind::Responses => "responses",
                     RequestKind::Compact => "compact",
                     RequestKind::Search => "search",
+                    RequestKind::ImageGeneration => "image_generation",
+                    RequestKind::ImageEdit => "image_edit",
                 });
         }
         q.push("), filtered AS MATERIALIZED (SELECT * FROM candidates WHERE TRUE");

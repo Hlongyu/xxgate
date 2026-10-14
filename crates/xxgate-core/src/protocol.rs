@@ -22,6 +22,14 @@ pub enum RequestKind {
     Responses,
     Compact,
     Search,
+    ImageGeneration,
+    ImageEdit,
+}
+
+impl RequestKind {
+    pub fn is_image(self) -> bool {
+        matches!(self, Self::ImageGeneration | Self::ImageEdit)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,6 +171,7 @@ pub trait ProviderAdapter: Send + Sync {
         ids: &mut IdentityMap,
     ) -> Result<PreparedRequest>;
     fn decoder(&self) -> Box<dyn ProviderDecoder>;
+    fn image_response(&self, body: &[u8]) -> Result<Usage>;
     fn search_response(&self, body: &[u8]) -> Result<Usage>;
     fn compact_response(&self, body: &[u8]) -> Result<Observation>;
     fn headers(&self, headers: &HeaderMap) -> Observation;

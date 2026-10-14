@@ -53,6 +53,12 @@ pub async fn compact(State(state): State<AppState>, request: Request) -> Respons
 pub async fn search(State(state): State<AppState>, request: Request) -> Response {
     handle(state, request, RequestKind::Search).await
 }
+pub async fn image_generations(State(state): State<AppState>, request: Request) -> Response {
+    handle(state, request, RequestKind::ImageGeneration).await
+}
+pub async fn image_edits(State(state): State<AppState>, request: Request) -> Response {
+    handle(state, request, RequestKind::ImageEdit).await
+}
 async fn handle(state: AppState, request: Request, kind: RequestKind) -> Response {
     let id = Uuid::new_v4();
     let started = tokio::time::Instant::now();
@@ -136,7 +142,17 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
                 tracing::error!(request_id=%id,code=%save_error.code,"rejected request persistence failed");
             }
             tracing::warn!(request_id=%id,key_id=%record.key_id,group_id=?record.group_id,model=%record.model,code=%error.0.code,status=error.0.status,diagnostics=%record.ingress_diagnostics.as_ref().unwrap_or(&serde_json::Value::Null),"request rejected");
-            error.into_response()
+            let memory_rejected = matches!(
+                error.0.code.as_str(),
+                "memory_pressure" | "memory_probe_unavailable" | "request_read_limit"
+            );
+            let mut response = error.into_response();
+            if memory_rejected {
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("5"));
+            }
+            response
         }
     };
     if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
@@ -188,12 +204,36 @@ async fn responses_inner(
     let key = gateway_key(state, &parts.headers).await?;
     context.key_id = Some(key.id);
     context.group_id = Some(key.group_id);
+    context.stage = "memory_admission";
+    let _reading = state
+        .gateway
+        .memory_admission
+        .enter()
+        .map_err(|rejection| memory_rejection(state, context, *rejection))?;
     context.stage = "body_encoding";
     if parts.headers.get("content-encoding").is_some() {
         return Err(Error::new(
             415,
             "content_encoding_unsupported",
             "Send an uncompressed JSON request",
+        )
+        .into());
+    }
+    if kind.is_image()
+        && parts.headers.get("content-type").is_some_and(|v| {
+            v.to_str().map_or(true, |s| {
+                !s.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/json")
+            })
+        })
+    {
+        return Err(Error::new(
+            415,
+            "image_json_required",
+            "Codex Images requires application/json; use images with image_url for edits",
         )
         .into());
     }
@@ -214,8 +254,13 @@ async fn responses_inner(
                         "The request exceeds the configured size limit",
                     ));
                 }
-                // Conservative reservation includes the parsed JSON tree and outgoing copies.
-                memory.resize(size.saturating_mul(16))?;
+                state
+                    .gateway
+                    .memory_admission
+                    .check(false)
+                    .map_err(|rejection| memory_rejection(state, context, *rejection))?;
+                // Count buffered bytes for telemetry, not speculative heap reservations.
+                memory.resize(size)?;
                 raw.extend_from_slice(&data);
             }
         }
@@ -225,10 +270,23 @@ async fn responses_inner(
     .map_err(|_| Error::new(408, "body_timeout", "Request body timed out"))??;
     let length = raw.len();
     context.stage = "json_parse";
-    let document: Value = serde_json::from_slice(&raw).map_err(|_| {
-        context.diagnostics["body_status"] = json!("invalid_json");
-        Error::invalid("The body must contain valid JSON")
-    })?;
+    state
+        .gateway
+        .memory_admission
+        .check(true)
+        .map_err(|rejection| memory_rejection(state, context, *rejection))?;
+    let parser = state.gateway.memory_admission.parser().await;
+    let document: Value = xxgate_core::memory_json::parse(&raw, &state.gateway.memory_admission)
+        .map_err(|error| match error {
+            xxgate_core::memory_json::ParseError::Memory(rejection) => {
+                memory_rejection(state, context, *rejection)
+            }
+            xxgate_core::memory_json::ParseError::Invalid => {
+                context.diagnostics["body_status"] = json!("invalid_json");
+                Error::invalid("The body must contain valid JSON")
+            }
+        })?;
+    drop(parser);
     context.diagnostics = xxgate_codex::identity_input::diagnostics(
         parts.method.as_str(),
         parts.uri.path(),
@@ -263,6 +321,9 @@ async fn responses_inner(
         }
         RequestKind::Compact => xxgate_codex::compaction::parse(&parts.headers, document)?,
         RequestKind::Responses => state.gateway.ingress.parse(&parts.headers, document)?,
+        RequestKind::ImageGeneration | RequestKind::ImageEdit => {
+            xxgate_codex::images::parse(&parts.headers, document, kind)?
+        }
     };
     context.stateless = parsed.stateless;
     if !parsed.stateless {
@@ -271,7 +332,13 @@ async fn responses_inner(
     }
     parsed.ingress_diagnostics = Some(context.diagnostics.clone());
     context.stage = "admission";
+    state
+        .gateway
+        .memory_admission
+        .check(true)
+        .map_err(|rejection| memory_rejection(state, context, *rejection))?;
     let handle = state.gateway.start(id, key, parsed, length, memory).await?;
+    drop(_reading);
     let id = handle.id.to_string();
     let mut response = if handle.stream {
         let stream = ReceiverStream::new(handle.bytes).map(Ok::<_, Infallible>);
@@ -313,4 +380,14 @@ async fn responses_inner(
         HeaderValue::from_str(&id).map_err(|_| Error::storage())?,
     );
     Ok(response)
+}
+
+fn memory_rejection(
+    state: &AppState,
+    context: &mut RejectedContext,
+    rejection: xxgate_core::memory::MemoryRejection,
+) -> Error {
+    let queue = state.gateway.scheduler.stats();
+    context.diagnostics["memory"] = json!({"snapshot":rejection.status,"inflight_requests":queue.inflight,"queued_requests":queue.queued,"body_bytes_read":context.bytes});
+    rejection.error
 }

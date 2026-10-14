@@ -157,6 +157,25 @@ pub fn value_usage(
     let Some(output) = usage.output_tokens else {
         return result;
     };
+    // Standalone Images reports modality subsets within the totals. Responses
+    // tool usage is separate from its main model usage and keeps its old rules.
+    let (input, output) = if usage.source == "images_response" {
+        let (Some(image_input), Some(image_output)) =
+            (usage.image_input_tokens, usage.image_output_tokens)
+        else {
+            return result;
+        };
+        let (Some(text_input), Some(text_output)) = (
+            input.checked_sub(image_input),
+            output.checked_sub(image_output),
+        ) else {
+            result.status = "invalid_usage".into();
+            return result;
+        };
+        (text_input, text_output)
+    } else {
+        (input, output)
+    };
     let Some(price) = price else {
         result.status = "unpriced".into();
         return result;
@@ -275,6 +294,59 @@ mod tests {
             price.per_call = Some(invalid);
             assert!(price.validate().is_err());
         }
+    }
+    #[test]
+    fn standalone_image_totals_are_not_billed_twice() {
+        let mut price = price();
+        price.standard.image_input_per_million = Some(Decimal::from(30));
+        price.standard.image_output_per_million = Some(Decimal::from(40));
+        let mut usage = Usage {
+            input_tokens: Some(20),
+            output_tokens: Some(515),
+            cached_input_tokens: Some(0),
+            image_input_tokens: Some(2),
+            image_output_tokens: Some(515),
+            image_count: 1,
+            image_tool_usage_reported: true,
+            complete: true,
+            source: "images_response".into(),
+            ..Default::default()
+        };
+        let cost = value_usage(&usage, None, Some(&price));
+        assert_eq!(cost.cny, Some(Decimal::new(2084, 5)));
+        assert_eq!(
+            cost.items
+                .iter()
+                .find(|i| i.kind == "input")
+                .unwrap()
+                .quantity,
+            18
+        );
+        assert_eq!(
+            cost.items
+                .iter()
+                .find(|i| i.kind == "output")
+                .unwrap()
+                .quantity,
+            0
+        );
+        price.standard.image_input_per_million = None;
+        price.standard.image_output_per_million = None;
+        price.standard.per_image = Some(Decimal::ONE);
+        assert_eq!(
+            value_usage(&usage, None, Some(&price)).cny,
+            Some(Decimal::new(100018, 5))
+        );
+        usage.image_output_tokens = None;
+        assert_eq!(
+            value_usage(&usage, None, Some(&price)).status,
+            "usage_unknown"
+        );
+        usage.image_output_tokens = Some(516);
+        assert_eq!(
+            value_usage(&usage, None, Some(&price)).status,
+            "invalid_usage"
+        );
     }
     fn price() -> Price {
         Price {

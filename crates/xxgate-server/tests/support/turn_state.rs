@@ -98,7 +98,7 @@ pub(super) async fn verify(c: &Client, mock: &Mock) {
                     .to_string()
                     .contains("client-opaque")
             );
-            assert!(!d.to_string().contains("PRIVATE_"));
+            assert_no_private_outside_original(&d);
             let list = c.admin(&format!("/requests?id={id}"), "GET", None).await;
             assert!(list["items"][0].get("client_turn_state").is_none());
             assert!(!list.to_string().contains("client-opaque"));

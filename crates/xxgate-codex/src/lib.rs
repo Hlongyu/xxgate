@@ -2,6 +2,7 @@ pub mod client_source;
 pub mod compaction;
 pub mod identity_input;
 mod identity_trace;
+pub mod images;
 pub mod ingress;
 pub mod provider;
 pub mod search;

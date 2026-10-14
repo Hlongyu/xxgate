@@ -12,6 +12,14 @@ use xxgate_core::{
 };
 
 pub(crate) fn validate(r: &GatewayRequest, m: &ModelSpec) -> Result<()> {
+    if r.kind.is_image() {
+        return crate::images::validate(r, m);
+    }
+    if xxgate_core::providers::is_codex_image_model(&m.upstream) {
+        return Err(Error::invalid(
+            "Use /images/generations or /images/edits for this model",
+        ));
+    }
     if r.document.format != FORMAT && r.document.format != crate::search::FORMAT {
         return Err(Error::new(
             400,
@@ -213,7 +221,7 @@ fn identity_kind(name: &str) -> Option<&'static str> {
         | "parent_thread_id"
         | "forked_from_thread_id"
         | "x-codex-parent-thread-id" => Some("thread"),
-        "turn_id" | "parent_turn_id" | "root_turn_id" => Some("turn"),
+        "turn_id" | "parent_turn_id" | "root_turn_id" | "x-codex-image-turn-id" => Some("turn"),
         "window_id" | "x-codex-window-id" => Some("window"),
         "context_window_id" => Some("context_window"),
         "x-client-request-id" => Some("request"),

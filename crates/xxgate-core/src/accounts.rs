@@ -77,11 +77,12 @@ impl Account {
             && self.access_kind == model.access_kind
             && ((!self.models_restricted && self.models.is_empty())
                 || self.models.contains(&model.model))
-            && self
-                .model_catalog
-                .as_ref()
-                .filter(|c| c.synced_at.is_some())
-                .is_none_or(|c| c.models.iter().any(|m| m.id == model.model))
+            && (crate::providers::is_codex_image_model(model)
+                || self
+                    .model_catalog
+                    .as_ref()
+                    .filter(|c| c.synced_at.is_some())
+                    .is_none_or(|c| c.models.iter().any(|m| m.id == model.model)))
     }
     pub fn validate(&self, allow_http: bool) -> Result<()> {
         if self.group_ids.len() > 64

@@ -11,17 +11,33 @@ pub struct Error {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<Box<UpstreamError>>,
     // Upstream text may quote request content. Return it only to this caller;
-    // keep persistence, Display and Debug limited to the classified message.
+    // keep Display and Debug limited to the classified message. Bounded original
+    // diagnostics are persisted separately for administrator request details.
     #[serde(skip)]
     client_message: Option<ClientMessage>,
 }
 
-/// Allowlisted facts extracted by the provider; never free-form upstream text.
+/// Classified facts plus bounded, detail-only original upstream diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamError {
     pub code: Option<String>,
     pub reason: Option<String>,
     pub param: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<OriginalUpstreamError>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OriginalUpstreamError {
+    pub source: String,
+    pub fields: serde_json::Value,
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for OriginalUpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<original upstream error; administrator detail only>")
+    }
 }
 
 #[derive(Clone)]

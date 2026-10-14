@@ -66,3 +66,8 @@ impl ModelSpec {
         Ok(())
     }
 }
+
+/// Standalone Codex Images models are not advertised by the Responses catalog.
+pub fn is_codex_image_model(model: &ModelRef) -> bool {
+    model.provider == "openai" && model.access_kind == "codex_oauth" && model.model == "gpt-image-2"
+}

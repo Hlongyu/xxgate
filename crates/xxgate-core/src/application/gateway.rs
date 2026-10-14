@@ -38,6 +38,7 @@ pub struct Gateway {
     pub scheduler: Scheduler,
     pub settings: LiveSettings,
     pub memory: MemoryBudget,
+    pub memory_admission: crate::memory::MemoryAdmission,
     pub ingress: Arc<dyn IngressAdapter>,
     pub provider: Arc<dyn ProviderAdapter>,
     pub transport: Arc<dyn UpstreamTransport>,
@@ -86,6 +87,25 @@ impl Gateway {
         provider: Arc<dyn ProviderAdapter>,
         transport_builder: impl FnOnce(LiveSettings) -> Arc<dyn UpstreamTransport>,
     ) -> Result<Arc<Self>> {
+        Self::new_with_memory_probe(
+            store,
+            cipher,
+            ingress,
+            provider,
+            transport_builder,
+            Arc::new(crate::memory::SystemMemoryProbe),
+        )
+        .await
+    }
+
+    pub async fn new_with_memory_probe(
+        store: Arc<dyn Store>,
+        cipher: CredentialCipher,
+        ingress: Arc<dyn IngressAdapter>,
+        provider: Arc<dyn ProviderAdapter>,
+        transport_builder: impl FnOnce(LiveSettings) -> Arc<dyn UpstreamTransport>,
+        memory_probe: Arc<dyn crate::memory::MemoryProbe>,
+    ) -> Result<Arc<Self>> {
         let settings = LiveSettings::new(store.settings().await?);
         let scheduler = Scheduler::new(
             settings.clone(),
@@ -97,7 +117,8 @@ impl Gateway {
         Ok(Arc::new(Self {
             store,
             scheduler,
-            memory: MemoryBudget::new(settings.clone()),
+            memory: MemoryBudget::new(),
+            memory_admission: crate::memory::MemoryAdmission::new(settings.clone(), memory_probe),
             settings,
             ingress,
             provider,
@@ -568,7 +589,9 @@ impl Gateway {
                 e.response_headers
                     .insert("x-codex-turn-state", value.clone());
             }
-            if matches!(request.kind, RequestKind::Search | RequestKind::Compact) {
+            if matches!(request.kind, RequestKind::Search | RequestKind::Compact)
+                || request.kind.is_image()
+            {
                 return self.receive_unary(response.bytes, e, since, started).await;
             }
             let mut decoder = self.provider.decoder();
@@ -603,7 +626,7 @@ impl Gateway {
                     ));
                 };
                 let chunk = chunk?;
-                decode_memory.resize((decoder.buffered_bytes() + chunk.len()).saturating_mul(3))?;
+                decode_memory.resize(decoder.buffered_bytes() + chunk.len())?;
                 let events = decoder.push(
                     &chunk,
                     &mut ids,
@@ -706,7 +729,7 @@ impl Gateway {
                             .await?;
                     }
                 }
-                decode_memory.resize(decoder.buffered_bytes().saturating_mul(3))?;
+                decode_memory.resize(decoder.buffered_bytes())?;
             }
         }
     }
@@ -774,6 +797,7 @@ impl Gateway {
         started: Instant,
     ) -> Result<()> {
         let compact = e.record.kind == RequestKind::Compact;
+        let image = e.record.kind.is_image();
         let mut body = BytesMut::new();
         let mut memory = self.memory.lease();
         let mut cfg = self.settings.subscribe();
@@ -783,7 +807,7 @@ impl Gateway {
             let chunk = tokio::select! {
                 biased;
                 _=cfg.changed()=>continue,
-                _=tokio::time::sleep_until(started+Duration::from_millis(snapshot.sse_idle_timeout_ms))=>return Err(Error::new(504, if compact { "compact_timeout" } else { "search_timeout" }, "Upstream JSON response timed out")),
+                _=tokio::time::sleep_until(started+Duration::from_millis(snapshot.sse_idle_timeout_ms))=>return Err(Error::new(504, if image { "image_timeout" } else if compact { "compact_timeout" } else { "search_timeout" }, "Upstream JSON response timed out")),
                 chunk=stream.next()=>chunk,
             };
             let Some(chunk) = chunk else {
@@ -794,7 +818,9 @@ impl Gateway {
             if size > snapshot.sse_event_limit_bytes {
                 return Err(Error::new(
                     502,
-                    if compact {
+                    if image {
+                        "image_response_too_large"
+                    } else if compact {
                         "compact_response_too_large"
                     } else {
                         "search_response_too_large"
@@ -802,7 +828,7 @@ impl Gateway {
                     "Upstream JSON response exceeds the configured limit",
                 ));
             }
-            memory.resize(size.saturating_mul(16))?;
+            memory.resize(size)?;
             if !chunk.is_empty() {
                 e.record
                     .first_event_ms
@@ -819,6 +845,8 @@ impl Gateway {
             if let Some(compaction) = &mut e.record.compaction {
                 compaction.output_observed = observation.compaction_output;
             }
+        } else if image {
+            e.record.usage = self.provider.image_response(&body)?;
         } else {
             e.record.usage = self.provider.search_response(&body)?;
         }

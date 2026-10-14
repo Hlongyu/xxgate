@@ -1,3 +1,4 @@
+mod error_diagnostics;
 mod events;
 mod models;
 pub mod oauth;
@@ -42,6 +43,9 @@ impl ProviderAdapter for CodexProvider {
     }
     fn compact_response(&self, body: &[u8]) -> Result<Observation> {
         events::compact_response(body)
+    }
+    fn image_response(&self, body: &[u8]) -> Result<xxgate_core::usage::Usage> {
+        crate::images::response(body)
     }
     fn search_response(&self, body: &[u8]) -> Result<xxgate_core::usage::Usage> {
         let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
@@ -107,7 +111,9 @@ impl ProviderAdapter for CodexProvider {
         c: &Credentials,
         ids: &mut IdentityMap,
     ) -> Result<PreparedRequest> {
-        if r.kind == xxgate_core::protocol::RequestKind::Search {
+        if r.kind.is_image() {
+            crate::images::prepare(r, m, a, c, ids)
+        } else if r.kind == xxgate_core::protocol::RequestKind::Search {
             crate::search::prepare(r, m, a, c, ids)
         } else {
             request::prepare(r, m, a, c, ids)
@@ -206,7 +212,9 @@ pub(crate) fn classify_error(status: u16, body: &[u8]) -> (Error, Option<Disable
     } else {
         classify_parsed_error(status, parsed.as_ref())
     };
-    (error.with_upstream(error_facts(parsed.as_ref())), disable)
+    let mut facts = error_facts(parsed.as_ref()).unwrap_or_default();
+    facts.original = Some(error_diagnostics::capture(parsed.as_ref(), body));
+    (error.with_upstream(Some(facts)), disable)
 }
 
 fn classify_parsed_error(
@@ -395,6 +403,7 @@ fn error_facts(value: Option<&serde_json::Value>) -> Option<xxgate_core::types::
         code: code.map(str::to_owned),
         reason: reason.map(str::to_owned),
         param: param.map(str::to_owned),
+        original: None,
     })
 }
 
@@ -422,7 +431,7 @@ mod tests {
                     Some("cybersecurity_risk")
                 );
                 assert!(disable.is_none());
-                assert!(!serde_json::to_string(&error).unwrap().contains("PRIVATE_"));
+                assert!(!format!("{error:?}").contains("PRIVATE_"));
             }
         }
         for code in [
@@ -443,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_facts_preserve_known_causes_without_free_text() {
+    fn upstream_facts_keep_classification_and_original_diagnostics_separate() {
         let (error, _) = classify_error(
             400,
             br#"{"detail":"Unsupported parameter: max_output_tokens"}"#,
@@ -457,13 +466,16 @@ mod tests {
             Some("invalid_encrypted_content")
         );
         assert_eq!(error.client_message(), "PRIVATE_REQUEST_CONTENT");
-        assert!(!serde_json::to_string(&error).unwrap().contains("PRIVATE_"));
+        assert!(!format!("{error:?}").contains("PRIVATE_"));
         let (error,_) = classify_error(400, br#"{"error":{"code":"PRIVATE_CODE","param":"PRIVATE_PARAM","message":"PRIVATE_TEXT"}}"#);
-        assert!(error.upstream.is_none());
+        assert_eq!(
+            error.upstream.unwrap().original.unwrap().fields["code"],
+            "PRIVATE_CODE"
+        );
     }
 
     #[test]
-    fn upstream_error_detail_is_returned_only_to_the_requesting_client() {
+    fn upstream_error_detail_is_persisted_without_entering_debug_or_display() {
         for body in [
             json!({"error":{"code":"invalid_encrypted_content","message":"PRIVATE_HISTORY: encrypted_content is invalid"}}),
             json!({"detail":"PRIVATE_HISTORY: encrypted_content is invalid"}),
@@ -481,7 +493,7 @@ mod tests {
             assert!(!error.to_string().contains("PRIVATE_"));
             assert!(!format!("{error:?}").contains("PRIVATE_"));
             let saved = serde_json::to_string(&error).unwrap();
-            assert!(!saved.contains("PRIVATE_"));
+            assert!(saved.contains("PRIVATE_HISTORY"));
             let restored: Error = serde_json::from_str(&saved).unwrap();
             assert_eq!(restored.client_message(), restored.message);
         }

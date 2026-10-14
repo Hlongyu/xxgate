@@ -707,16 +707,15 @@ impl Drop for DispatchLease {
     }
 }
 
-#[derive(Clone)]
+/// Buffered-byte telemetry only; admission uses measured memory pressure.
+#[derive(Clone, Default)]
 pub struct MemoryBudget {
     used: Arc<Mutex<usize>>,
-    settings: LiveSettings,
 }
 impl MemoryBudget {
-    pub fn new(settings: LiveSettings) -> Self {
+    pub fn new() -> Self {
         Self {
             used: Arc::new(Mutex::new(0)),
-            settings,
         }
     }
     pub fn used(&self) -> usize {
@@ -746,16 +745,7 @@ impl MemoryLease {
     }
     pub fn grow(&mut self, bytes: usize) -> Result<()> {
         let mut used = self.budget.used.lock().unwrap_or_else(|e| e.into_inner());
-        let next = used
-            .checked_add(bytes)
-            .ok_or_else(|| Error::new(429, "memory_limit", "Request memory budget is exhausted"))?;
-        if next > self.budget.settings.current().queue_memory_bytes {
-            return Err(Error::new(
-                429,
-                "memory_limit",
-                "Request memory budget is exhausted",
-            ));
-        }
+        let next = used.checked_add(bytes).ok_or_else(Error::storage)?;
         *used = next;
         self.bytes += bytes;
         Ok(())

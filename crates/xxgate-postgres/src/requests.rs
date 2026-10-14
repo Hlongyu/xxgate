@@ -140,6 +140,8 @@ fn request_where<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a RequestFilter) {
                 xxgate_core::protocol::RequestKind::Search => "search",
                 xxgate_core::protocol::RequestKind::Responses => "responses",
                 xxgate_core::protocol::RequestKind::Compact => "compact",
+                xxgate_core::protocol::RequestKind::ImageGeneration => "image_generation",
+                xxgate_core::protocol::RequestKind::ImageEdit => "image_edit",
             });
     }
     if let Some(v) = f.account_id {

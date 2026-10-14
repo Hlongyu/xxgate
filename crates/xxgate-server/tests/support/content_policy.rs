@@ -80,7 +80,7 @@ pub(super) async fn verify(c: &Client, mock: &Mock) {
                     .unwrap()
                     .contains("cybersecurity risk")
             );
-            assert!(!detail.to_string().contains("PRIVATE_"));
+            assert_no_private_outside_original(&detail);
             let page = c
                 .admin(
                     &format!("/request-errors?request_id={id}&cause=cybersecurity_risk"),

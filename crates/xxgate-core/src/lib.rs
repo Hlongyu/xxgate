@@ -5,6 +5,8 @@ pub mod audit;
 pub mod clients;
 pub mod groups;
 pub mod identity;
+pub mod memory;
+pub mod memory_json;
 pub mod pricing;
 pub mod protocol;
 pub mod providers;

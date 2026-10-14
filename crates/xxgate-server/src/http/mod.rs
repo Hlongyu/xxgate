@@ -148,6 +148,10 @@ pub fn router(state: AppState) -> Router {
         .layer(tower_http::compression::CompressionLayer::new().quality(
             tower_http::CompressionLevel::Precise(4),
         ))
+        .route("/v1/images/generations", post(public::image_generations))
+        .route("/images/generations", post(public::image_generations))
+        .route("/v1/images/edits", post(public::image_edits))
+        .route("/images/edits", post(public::image_edits))
         .route("/v1/responses", post(public::responses))
         .route("/responses", post(public::responses))
         .route("/v1/responses/compact", post(public::compact))

@@ -240,7 +240,7 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
             json!({"method":"remote_v2","output_observed":true})
         );
         assert_eq!(r["request"]["usage"]["input_tokens"], 1000);
-        assert!(!r.to_string().contains("PRIVATE_"));
+        assert_no_private_outside_original(&r);
         let captured = mock.captures.lock().await.last().unwrap().clone();
         assert_eq!(captured.1["input"], v2["input"]);
         let projected: Value =
@@ -285,7 +285,7 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         assert_eq!(mock.compact.lock().await.len(), before + 1);
         assert_eq!(r["request"]["usage"]["complete"], false);
         assert!(r["request"]["valuation"]["cny"].is_null());
-        assert!(!r.to_string().contains("PRIVATE_"));
+        assert_no_private_outside_original(&r);
     }
     let before = mock.compact.lock().await.len();
     let mut streaming = body.clone();

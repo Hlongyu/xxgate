@@ -175,7 +175,7 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         assert_eq!(failed_record["request"]["usage"]["search_calls"], 0);
         assert_eq!(failed_record["request"]["valuation"]["cny"], "0");
         assert_eq!(failed_record["request"]["upstream_attempts"], 1);
-        assert!(!failed_record.to_string().contains("PRIVATE_"));
+        assert_no_private_outside_original(&failed_record);
         assert_eq!(mock.search.lock().await.captures.len(), before + 1);
     }
     let mut invalid_body = body.clone();

@@ -12,7 +12,11 @@ pub struct RuntimeSettings {
     pub connect_timeout_ms: u64,
     pub sse_idle_timeout_ms: u64,
     pub queue_capacity: usize,
+    /// Legacy configuration, retained for old clients; no longer used for admission.
     pub queue_memory_bytes: usize,
+    pub memory_reject_percent: u8,
+    pub memory_resume_percent: u8,
+    pub request_read_concurrency: usize,
     pub request_body_limit_bytes: usize,
     pub sse_event_limit_bytes: usize,
     pub global_max_inflight: u32,
@@ -34,6 +38,9 @@ impl Default for RuntimeSettings {
             sse_idle_timeout_ms: 300_000,
             queue_capacity: 2000,
             queue_memory_bytes: 512 * 1024 * 1024,
+            memory_reject_percent: 85,
+            memory_resume_percent: 75,
+            request_read_concurrency: 4,
             request_body_limit_bytes: 32 * 1024 * 1024,
             sse_event_limit_bytes: 64 * 1024 * 1024,
             global_max_inflight: 200,
@@ -49,6 +56,15 @@ impl Default for RuntimeSettings {
 
 impl RuntimeSettings {
     pub fn validate(&self) -> Result<()> {
+        if !(50..=95).contains(&self.memory_reject_percent)
+            || self.memory_resume_percent < 10
+            || self.memory_resume_percent >= self.memory_reject_percent
+            || !(1..=64).contains(&self.request_read_concurrency)
+        {
+            return Err(Error::invalid(
+                "Memory rejection must be 50–95%, recovery 10% to below rejection, and body reader concurrency 1–64",
+            ));
+        }
         for (name, value) in [
             ("queue_timeout_ms", self.queue_timeout_ms),
             ("connect_timeout_ms", self.connect_timeout_ms),
@@ -131,6 +147,22 @@ mod tests {
         let mut settings: RuntimeSettings = serde_json::from_str(r#"{"version":7}"#).unwrap();
         assert_eq!(settings.version, 7);
         assert_eq!(settings.session_max_inflight, 2);
+        assert_eq!(settings.memory_reject_percent, 85);
+        assert_eq!(settings.memory_resume_percent, 75);
+        assert_eq!(settings.request_read_concurrency, 4);
+        for (high, low, readers) in [
+            (96, 75, 4),
+            (85, 85, 4),
+            (85, 9, 4),
+            (85, 75, 0),
+            (85, 75, 65),
+        ] {
+            let mut bad = settings.clone();
+            bad.memory_reject_percent = high;
+            bad.memory_resume_percent = low;
+            bad.request_read_concurrency = readers;
+            assert!(bad.validate().is_err());
+        }
         for limit in [1, 2, 1000] {
             settings.session_max_inflight = limit;
             settings.validate().unwrap();

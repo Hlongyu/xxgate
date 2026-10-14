@@ -124,7 +124,7 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock) {
                 "client-recovery-turn-state"
             );
             assert_eq!(detail["bindings"].as_array().unwrap().len(), 1);
-            assert!(!detail.to_string().contains("PRIVATE_"));
+            assert_no_private_outside_original(&detail);
             let events = detail["events"].as_array().unwrap();
             let headers: Vec<_> = events
                 .iter()

@@ -28,7 +28,7 @@ pub async fn dashboard(
     Query(q): Query<UsageFilter>,
 ) -> ApiResult<Json<Value>> {
     let mut result = s.gateway.store.dashboard(&q).await?;
-    result["runtime"] = json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used(),"config_version":s.gateway.settings.current().version});
+    result["runtime"] = json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used(),"memory_admission":s.gateway.memory_admission.status(),"config_version":s.gateway.settings.current().version});
     Ok(Json(result))
 }
 // Read identity metadata without refreshing tokens or making upstream requests.
@@ -528,7 +528,9 @@ pub async fn request_detail(
     Ok(Json(s.gateway.store.request_detail(id).await?))
 }
 pub async fn queue(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used()}))
+    Json(
+        json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used(),"memory_admission":s.gateway.memory_admission.status()}),
+    )
 }
 pub async fn audit(
     State(s): State<AppState>,
@@ -553,8 +555,9 @@ pub async fn cleanup(State(s): State<AppState>) -> Json<Value> {
 }
 pub async fn metrics(State(s): State<AppState>) -> String {
     let q = s.gateway.scheduler.stats();
-    format!(
-        "# TYPE xxgate_requests_accepted_total counter\nxxgate_requests_accepted_total {}\n# TYPE xxgate_requests_completed_total counter\nxxgate_requests_completed_total {}\n# TYPE xxgate_requests_failed_total counter\nxxgate_requests_failed_total {}\n# TYPE xxgate_queue_requests gauge\nxxgate_queue_requests {}\n# TYPE xxgate_inflight_requests gauge\nxxgate_inflight_requests {}\n# TYPE xxgate_memory_reserved_bytes gauge\nxxgate_memory_reserved_bytes {}\n# TYPE xxgate_config_version gauge\nxxgate_config_version {}\n",
+    let memory = s.gateway.memory_admission.status();
+    let mut output = format!(
+        "# TYPE xxgate_requests_accepted_total counter\nxxgate_requests_accepted_total {}\n# TYPE xxgate_requests_completed_total counter\nxxgate_requests_completed_total {}\n# TYPE xxgate_requests_failed_total counter\nxxgate_requests_failed_total {}\n# TYPE xxgate_queue_requests gauge\nxxgate_queue_requests {}\n# TYPE xxgate_inflight_requests gauge\nxxgate_inflight_requests {}\n# TYPE xxgate_memory_buffered_bytes gauge\nxxgate_memory_buffered_bytes {}\n# TYPE xxgate_config_version gauge\nxxgate_config_version {}\n",
         s.gateway.accepted.load(Ordering::Relaxed),
         s.gateway.completed.load(Ordering::Relaxed),
         s.gateway.failed.load(Ordering::Relaxed),
@@ -562,5 +565,10 @@ pub async fn metrics(State(s): State<AppState>) -> String {
         q.inflight,
         s.gateway.memory.used(),
         s.gateway.settings.current().version
-    )
+    );
+    output.push_str(&format!("# TYPE xxgate_memory_admission_blocked gauge\nxxgate_memory_admission_blocked {}\nxxgate_memory_reading_requests {}\n", u8::from(memory.blocked), memory.reading_requests));
+    for (index, domain) in memory.domains.iter().enumerate() {
+        output.push_str(&format!("xxgate_memory_used_bytes{{domain=\"{}\"}} {}\nxxgate_memory_limit_bytes{{domain=\"{}\"}} {}\n", index, domain.used_bytes, index, domain.limit_bytes));
+    }
+    output
 }

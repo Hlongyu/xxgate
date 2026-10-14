@@ -1,3 +1,12 @@
+#[path = "support/upstream_errors.rs"]
+mod upstream_errors_contract;
+
+#[path = "support/memory.rs"]
+mod memory_contract;
+
+#[path = "support/images.rs"]
+mod images_contract;
+
 #[path = "support/extra_credits.rs"]
 mod extra_credits_contract;
 
@@ -152,6 +161,8 @@ struct Mock {
     search: Arc<Mutex<search_contract::SearchMock>>,
     search_release: Arc<Semaphore>,
     compact: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    images: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
+    images_release: Arc<Semaphore>,
 }
 struct ResetMock {
     credits: Vec<Value>,
@@ -314,6 +325,9 @@ async fn upstream(
         }
     }
     let behavior = body["instructions"].as_str().unwrap_or("normal").to_owned();
+    if let Some(response) = upstream_errors_contract::upstream(&behavior) {
+        return response;
+    }
     if let Some(response) = content_policy_contract::upstream(&behavior) {
         return response;
     }
@@ -549,9 +563,16 @@ async fn real_http_postgres_gateway_contract() {
         search: Default::default(),
         search_release: Arc::new(Semaphore::new(0)),
         compact: Default::default(),
+        images: Default::default(),
+        images_release: Arc::new(Semaphore::new(0)),
     };
     let (upstream_url, upstream_task) = serve(
         Router::new()
+            .route(
+                "/images/generations",
+                post(images_contract::upstream_images),
+            )
+            .route("/images/edits", post(images_contract::upstream_images))
             .route("/responses", post(upstream))
             .route(
                 "/responses/compact",
@@ -570,7 +591,8 @@ async fn real_http_postgres_gateway_contract() {
     .await;
     let browser_calls = Arc::new(AtomicUsize::new(0));
     let counted_browser = browser_calls.clone();
-    let gateway = Gateway::new(
+    let memory_probe = Arc::new(memory_contract::Probe::default());
+    let gateway = Gateway::new_with_memory_probe(
         store.clone(),
         CredentialCipher::new(&[7; 32]),
         Arc::new(ResponsesIngress),
@@ -582,6 +604,7 @@ async fn real_http_postgres_gateway_contract() {
                 browser_calls: counted_browser,
             })
         },
+        memory_probe.clone(),
     )
     .await
     .unwrap();
@@ -1266,7 +1289,7 @@ async fn real_http_postgres_gateway_contract() {
         assert_eq!(mock.calls.load(Ordering::SeqCst), before + 1);
         let record = c.record(&id).await;
         assert_eq!(record["request"]["state"], "failed");
-        assert!(!record.to_string().contains("PRIVATE_"));
+        assert_no_private_outside_original(&record);
     }
     let rejected = c
         .response("session-http400-json", "http400", false, "default")
@@ -1280,12 +1303,7 @@ async fn real_http_postgres_gateway_contract() {
         rejected.json::<Value>().await.unwrap()["error"]["message"],
         "PRIVATE_UPSTREAM_ERROR_TEXT"
     );
-    assert!(
-        !c.record(&rejected_id)
-            .await
-            .to_string()
-            .contains("PRIVATE_")
-    );
+    assert_no_private_outside_original(&c.record(&rejected_id).await);
     let mut stalled = c.response("session-idle", "stall", true, "default").await;
     let stall_id = stalled.headers()["x-request-id"]
         .to_str()
@@ -1329,6 +1347,8 @@ async fn real_http_postgres_gateway_contract() {
 
     let identity_record_id = identity_contract::verify(&c, &store, &mock).await;
     client_sources_contract::verify(&c, &store, &mock, a, b).await;
+    memory_contract::verify(&c, &gateway, &mock, &memory_probe, a, b).await;
+    images_contract::verify(&c, &gateway, &mock, a, b, &memory_probe).await;
     let search_record_id = search_contract::verify(&c, &gateway, &mock, a, b).await;
     let failure = c
         .response("error-center-contract", "http400", false, "default")
@@ -1383,6 +1403,7 @@ async fn real_http_postgres_gateway_contract() {
     session_concurrency_contract::verify(&c, &gateway, &mock, a, b).await;
     model_migration_contract::verify(&c, &gateway, &mock, a, b).await;
     encrypted_reasoning_recovery_contract::verify(&c, &gateway, &mock).await;
+    upstream_errors_contract::verify(&c).await;
     content_policy_contract::verify(&c, &mock).await;
     content_policy_contract::verify_sessions(&c, &gateway, &mock).await;
     stream_recovery_contract::verify(&c, &gateway, &mock).await;
@@ -1509,7 +1530,7 @@ async fn real_http_postgres_gateway_contract() {
     // Summaries survive cleanup, request bodies never enter persistent reports.
     let dashboard = c.admin("/dashboard", "GET", None).await;
     assert!(dashboard["summary"]["requests"].as_i64().unwrap() >= 12);
-    assert_eq!(dashboard["summary"]["images"], 1);
+    assert_eq!(dashboard["summary"]["images"], 6);
     let fast = c
         .admin("/dashboard?service_tier=priority", "GET", None)
         .await;
@@ -1536,12 +1557,7 @@ async fn real_http_postgres_gateway_contract() {
         .unwrap()
         .to_owned();
     assert_eq!(c.record(&rejected_id).await["request"]["state"], "rejected");
-    assert!(
-        !c.record(&rejected_id)
-            .await
-            .to_string()
-            .contains("PRIVATE_")
-    );
+    assert_no_private_outside_original(&c.record(&rejected_id).await);
     let ciphertext = store
         .credentials(Uuid::parse_str(a).unwrap())
         .await
@@ -1574,12 +1590,13 @@ async fn real_http_postgres_gateway_contract() {
         store.dashboard(&UsageFilter::default()).await.unwrap()["summary"],
         totals["summary"]
     );
-    let restored = Gateway::new(
+    let restored = Gateway::new_with_memory_probe(
         store.clone(),
         CredentialCipher::new(&[7; 32]),
         Arc::new(ResponsesIngress),
         Arc::new(CodexProvider),
         |s| Arc::new(HttpTransport::new(s, true)),
+        memory_probe.clone(),
     )
     .await
     .unwrap();
@@ -2137,4 +2154,12 @@ async fn group_contract(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, b: 
     assert_eq!(saved_key.group_id.to_string(), blue["id"].as_str().unwrap());
     assert!(!saved_key.enabled);
     scoped.key.clear();
+}
+
+fn assert_no_private_outside_original(detail: &Value) {
+    let mut safe = detail.clone();
+    if let Some(error) = safe["request"]["upstream_error"].as_object_mut() {
+        error.remove("original");
+    }
+    assert!(!safe.to_string().contains("PRIVATE_"), "{safe}");
 }
