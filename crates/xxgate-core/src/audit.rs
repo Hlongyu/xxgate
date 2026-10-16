@@ -36,6 +36,9 @@ impl AuditEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
+    /// Captured at admission; None preserves diagnostics for legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_log_level: Option<crate::settings::LogLevel>,
     /// Detail-only observation; None means this older record did not capture it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_turn_state: Option<crate::turn_state::TurnStateHeader>,
@@ -94,4 +97,59 @@ pub struct RequestRecord {
     pub config_versions: Vec<i64>,
     pub body_bytes: usize,
     pub upstream_attempts: u32,
+}
+
+impl RequestRecord {
+    pub fn summary_only(&self) -> bool {
+        self.request_log_level
+            .is_some_and(|level| level != crate::settings::LogLevel::Debug)
+            && self.state == "completed"
+            && self.error_code.is_none()
+            && self.upstream_error.is_none()
+            && self.usage.complete
+            && self.upstream_attempts <= 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{settings::LogLevel, usage::Usage};
+    use serde_json::json;
+
+    #[test]
+    fn only_clean_successes_at_non_debug_levels_are_summarized() {
+        let mut record: RequestRecord = serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"key_id":Uuid::new_v4(),"client_session_id":"s",
+            "client_thread_id":"t","model":"m","provider":"openai","state":"completed",
+            "created_at":Utc::now(),"usage":Usage {complete:true,..Default::default()},
+            "config_version":1,"config_versions":[1],"body_bytes":100,"upstream_attempts":1
+        }))
+        .unwrap();
+        assert!(!record.summary_only()); // Legacy records retain their details.
+        for level in [LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
+            record.request_log_level = Some(level);
+            assert!(record.summary_only());
+            for state in [
+                "queued",
+                "inflight",
+                "failed",
+                "rejected",
+                "cancelled",
+                "interrupted",
+            ] {
+                record.state = state.into();
+                assert!(!record.summary_only());
+            }
+            record.state = "completed".into();
+            record.upstream_attempts = 2;
+            assert!(!record.summary_only());
+            record.upstream_attempts = 1;
+            record.usage.complete = false;
+            assert!(!record.summary_only());
+            record.usage.complete = true;
+        }
+        record.request_log_level = Some(LogLevel::Debug);
+        assert!(!record.summary_only());
+    }
 }

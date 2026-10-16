@@ -54,8 +54,10 @@ impl RequestStore for PgStore {
     async fn finish_request(&self, r: &RequestRecord) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let finished_at = r.finished_at.unwrap_or_else(Utc::now);
+        let mut data = encode(r)?;
+        data["detail_level"] = json!("full");
         let rows=sqlx::query("UPDATE requests SET account_id=$2,state=$3,finished_at=$4,data=$5 WHERE id=$1 AND finished_at IS NULL")
-            .bind(r.id).bind(r.account_id).bind(&r.state).bind(finished_at).bind(encode(r)?).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
+            .bind(r.id).bind(r.account_id).bind(&r.state).bind(finished_at).bind(data).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
         if rows == 0 {
             return Ok(());
         }
@@ -94,6 +96,21 @@ impl RequestStore for PgStore {
     async fn append_event(&self, event: &AuditEvent) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         event_tx(&mut tx, event).await?;
+        tx.commit().await.map_err(|_| Error::storage())?;
+        Ok(())
+    }
+    async fn summarize_request(&self, r: &RequestRecord) -> Result<()> {
+        if !r.summary_only() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
+        // Update only diagnostics; never recalculate usage or bill a second time.
+        let rows = sqlx::query("UPDATE requests SET data = ((data - 'ingress_diagnostics' - 'client_turn_state') #- '{usage,raw_usage}') || '{\"detail_level\":\"summary\"}'::jsonb WHERE id=$1 AND state='completed' AND finished_at IS NOT NULL AND COALESCE(data->>'detail_level','full')<>'summary' AND NOT EXISTS (SELECT 1 FROM audit_events WHERE request_id=$1 AND kind IN ('delivery_interrupted','encrypted_reasoning_recovery'))")
+            .bind(r.id).execute(&mut *tx).await.map_err(|_| Error::storage())?.rows_affected();
+        if rows > 0 {
+            sqlx::query("DELETE FROM audit_events WHERE request_id=$1 AND actor='gateway' AND kind IN ('request_rewritten','dispatched','upstream_attempt_headers')")
+                .bind(r.id).execute(&mut *tx).await.map_err(|_| Error::storage())?;
+        }
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(())
     }
@@ -300,7 +317,7 @@ impl ReportStore for PgStore {
         };
         let enrichment: Value = row.try_get("data").map_err(|_| Error::storage())?;
         let mut report = encode(&r)?;
-        for field in ["account_name", "price", "cache_previous"] {
+        for field in ["account_name", "price", "cache_previous", "detail_level"] {
             report[field] = enrichment[field].clone();
         }
         Ok(json!({"request":report,"events":events,"bindings":bindings,"mappings":mappings}))
@@ -379,6 +396,7 @@ mod cache_tests {
         let key = Uuid::new_v4();
         let start = Utc::now();
         let base = RequestRecord {
+            request_log_level: None,
             client_turn_state: None,
             client_origin: None,
             stateless: false,

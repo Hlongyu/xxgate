@@ -138,6 +138,9 @@ pub(crate) fn prepare(
         super::references::rewrite_input(input, ids)?;
     }
     body.entry("instructions").or_insert_with(|| json!(""));
+    if r.kind == RequestKind::Responses {
+        super::search_history::ensure_declaration(&mut body);
+    }
     body.insert("model".into(), json!(m.upstream.model));
     if r.kind != RequestKind::Compact {
         body.insert("store".into(), json!(false));

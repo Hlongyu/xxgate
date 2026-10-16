@@ -77,6 +77,7 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
             context.diagnostics["error"] =
                 json!({"code":error.0.code,"message":error.0.message,"status":error.0.status});
             let record = RequestRecord {
+                request_log_level: Some(state.gateway.settings.current().log_level),
                 client_turn_state: context.client_turn_state,
                 client_origin: serde_json::from_value(context.diagnostics["client_origin"].clone())
                     .ok(),

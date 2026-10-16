@@ -1,3 +1,5 @@
+#[path = "support/request_logging.rs"]
+mod request_logging_contract;
 #[path = "support/upstream_errors.rs"]
 mod upstream_errors_contract;
 
@@ -952,6 +954,8 @@ async fn real_http_postgres_gateway_contract() {
     let mut cfg = c.admin("/settings", "GET", None).await;
     cfg["heartbeat_interval_ms"] = json!(50);
     cfg["queue_timeout_ms"] = json!(5000);
+    assert_eq!(cfg["log_level"], "info");
+    cfg["log_level"] = json!("debug");
     c.admin("/settings", "PUT", Some(cfg)).await;
 
     // Stream conversion, aliases, usage, and metadata-only persistence.
@@ -1410,6 +1414,9 @@ async fn real_http_postgres_gateway_contract() {
     turn_state_contract::verify(&c, &mock).await;
 
     extra_credits_contract::verify(&c, &gateway, &mock, a).await;
+    c.enabled(a, true).await;
+    c.enabled(b, false).await;
+    request_logging_contract::verify(&c, &mock).await;
 
     // Quota exhaustion is sticky until the administrator explicitly reenables the account.
     let id = Uuid::parse_str(a).unwrap();

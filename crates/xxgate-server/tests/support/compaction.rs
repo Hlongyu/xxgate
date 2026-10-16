@@ -78,6 +78,7 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
     let meta = json!({"session_id":"session-compact","thread_id":"session-compact","request_kind":"compaction",
         "compaction":{"trigger":"auto","reason":"context_limit","implementation":"responses_compact","phase":"mid_turn","strategy":"memento"}});
     let body = json!({"model":"mock-model","instructions":"normal","input":[
+        {"type":"web_search_call","id":"ws_old","status":"completed","action":{"type":"search","query":"example"}},
         {"type":"compaction","id":"cmp_old","encrypted_content":"PRIVATE_COMPACT_HISTORY"},
         {"type":"message","id":"msg_original","role":"user","content":"PRIVATE_INPUT"}],
         "client_metadata":{"x-codex-turn-metadata":meta.to_string()},"prompt_cache_key":"session-compact",
@@ -186,6 +187,12 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         .unwrap()
         .remove("access_programs");
     continuation["input"] = compact_output()["output"].clone();
+    // Local summaries replay hosted search history with tools: []. The OAuth
+    // request must declare search without enabling any new tool calls.
+    continuation["input"].as_array_mut().unwrap().push(json!({
+        "type":"web_search_call","id":"ws_old","status":"completed",
+        "action":{"type":"search","query":"example"}
+    }));
     continuation["client_metadata"] = json!({});
     let normal = send(c, "/responses", continuation.clone()).await;
     let normal_id = normal.headers()["x-request-id"]
@@ -194,6 +201,12 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         .to_owned();
     assert_eq!(normal.status(), 200);
     normal.bytes().await.unwrap();
+    let forwarded = mock.captures.lock().await.last().unwrap().1.clone();
+    assert_eq!(
+        forwarded["tools"],
+        json!([{"type":"web_search","external_web_access":false}])
+    );
+    assert_eq!(forwarded["tool_choice"], "none");
     assert!(
         c.record(&normal_id).await["request"]
             .get("compaction")
@@ -243,6 +256,11 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         assert_no_private_outside_original(&r);
         let captured = mock.captures.lock().await.last().unwrap().clone();
         assert_eq!(captured.1["input"], v2["input"]);
+        assert_eq!(
+            captured.1["tools"],
+            json!([{"type":"web_search","external_web_access":false}])
+        );
+        assert_eq!(captured.1["tool_choice"], "none");
         let projected: Value =
             serde_json::from_slice(captured.0["x-codex-turn-metadata"].as_bytes()).unwrap();
         assert_eq!(projected["compaction"], v2meta["compaction"]);

@@ -14,13 +14,7 @@ use xxgate_postgres::PgStore;
 use xxgate_transport::HttpTransport;
 
 pub async fn run() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "xxgate=info,xxgate_server=info,xxgate_core=info".into()),
-        )
-        .json()
-        .init();
+    crate::logging::init();
     let database = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
     let key = STANDARD
         .decode(
@@ -55,6 +49,7 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .await?;
     // Fail startup before accepting traffic if the master key is not the one that encrypted the database.
+    crate::logging::set_level(gateway.settings.current().log_level);
     for account in gateway.scheduler.accounts() {
         if gateway
             .cipher

@@ -114,6 +114,8 @@ pub trait RequestStore: Send + Sync {
     async fn begin_request(&self, record: &RequestRecord) -> Result<()>;
     async fn update_request(&self, record: &RequestRecord) -> Result<()>;
     async fn finish_request(&self, record: &RequestRecord) -> Result<()>;
+    /// Called only after execution and terminal delivery succeeded.
+    async fn summarize_request(&self, record: &RequestRecord) -> Result<()>;
     async fn append_event(&self, event: &AuditEvent) -> Result<()>;
     async fn reconcile_interrupted(&self) -> Result<u64>;
 }

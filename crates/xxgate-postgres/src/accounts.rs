@@ -295,6 +295,6 @@ impl AccountStore for PgStore {
         Ok(())
     }
     async fn quotas(&self, id: Uuid) -> Result<Vec<QuotaWindow>> {
-        sqlx::query("SELECT DISTINCT ON(pool,window_minutes) data FROM quota_snapshots WHERE account_id=$1 ORDER BY pool,window_minutes,observed_at DESC,id DESC").bind(id).fetch_all(&self.pool).await.map_err(|_| Error::storage())?.iter().map(decode).collect()
+        sqlx::query("SELECT data FROM account_current_quotas WHERE account_id=$1 ORDER BY pool,window_minutes").bind(id).fetch_all(&self.pool).await.map_err(|_| Error::storage())?.iter().map(decode).collect()
     }
 }

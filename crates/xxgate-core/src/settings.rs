@@ -3,10 +3,32 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeSettings {
     pub version: i64,
+    pub log_level: LogLevel,
     pub queue_timeout_ms: u64,
     pub heartbeat_interval_ms: u64,
     pub connect_timeout_ms: u64,
@@ -32,6 +54,7 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             version: 1,
+            log_level: LogLevel::Info,
             queue_timeout_ms: 300_000,
             heartbeat_interval_ms: 10_000,
             connect_timeout_ms: 15_000,
@@ -146,6 +169,8 @@ mod tests {
     fn legacy_settings_default_session_capacity_and_reject_invalid_limits() {
         let mut settings: RuntimeSettings = serde_json::from_str(r#"{"version":7}"#).unwrap();
         assert_eq!(settings.version, 7);
+        assert_eq!(settings.log_level, LogLevel::Info);
+        assert!(serde_json::from_str::<RuntimeSettings>(r#"{"log_level":"trace"}"#).is_err());
         assert_eq!(settings.session_max_inflight, 2);
         assert_eq!(settings.memory_reject_percent, 85);
         assert_eq!(settings.memory_resume_percent, 75);

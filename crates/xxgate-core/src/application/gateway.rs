@@ -186,6 +186,7 @@ impl Gateway {
             since,
         )?;
         let record = RequestRecord {
+            request_log_level: Some(self.settings.current().log_level),
             client_turn_state: Some(request.client_turn_state.clone()),
             client_origin: Some(request.client_origin.clone()),
             stateless: request.stateless,
@@ -269,6 +270,13 @@ impl Gateway {
                 }
             } else if error.is_some() && !execution.terminal_delivered {
                 let _ = this.store.append_event(&AuditEvent::new("delivery_interrupted", "gateway", Some(id), execution.record.account_id, json!({"upstream_completed": true}))).await;
+            }
+            if error.is_none() && execution.finalized && execution.record.summary_only()
+                && let Err(error) = this.store.summarize_request(&execution.record).await
+            {
+                // Optional compaction failure must not turn a successful response
+                // into an error; retaining extra diagnostics is the safe fallback.
+                tracing::warn!(request_id=%id,code=%error.code,"request diagnostic compaction failed; full detail retained");
             }
             if let Some(error) = &error {
                 this.failed.fetch_add(1, Ordering::Relaxed);
@@ -512,7 +520,7 @@ impl Gateway {
             };
             e.record.upstream_status = Some(response.status);
             e.record.upstream_headers_ms = Some(started.elapsed().as_millis() as u64);
-            tracing::info!(request_id=%e.record.id,account_id=%lease.account.id,attempt=e.record.upstream_attempts,status=response.status,headers_ms=e.record.upstream_headers_ms,"upstream headers received");
+            tracing::debug!(request_id=%e.record.id,account_id=%lease.account.id,attempt=e.record.upstream_attempts,status=response.status,headers_ms=e.record.upstream_headers_ms,"upstream headers received");
             e.record.upstream_request_id = response
                 .headers
                 .get("x-request-id")
@@ -918,7 +926,7 @@ impl Gateway {
                 diagnostics["error"] =
                     json!({"code":error.code,"message":error.message,"status":error.status});
             }
-            tracing::warn!(request_id=%e.record.id,account_id=?e.record.account_id,code=%error.code,diagnostics=%e.record.ingress_diagnostics.as_ref().unwrap_or(&serde_json::Value::Null),"request failed");
+            tracing::warn!(request_id=%e.record.id,account_id=?e.record.account_id,code=%error.code,"request failed; diagnostics retained in request detail");
         }
         e.record.valuation = Some(if e.record.upstream_attempts == 0 {
             e.record.usage = Usage {
@@ -945,7 +953,7 @@ impl Gateway {
             )
         });
         self.store.finish_request(&e.record).await?;
-        tracing::info!(request_id=%e.record.id,account_id=?e.record.account_id,state=%e.record.state,code=?e.record.error_code,total_ms=e.record.total_ms,queue_ms=e.record.queue_ms,upstream_attempts=e.record.upstream_attempts,"request finished");
+        tracing::debug!(request_id=%e.record.id,account_id=?e.record.account_id,state=%e.record.state,code=?e.record.error_code,total_ms=e.record.total_ms,queue_ms=e.record.queue_ms,upstream_attempts=e.record.upstream_attempts,"request finished");
         e.finalized = true;
         Ok(())
     }

@@ -9,6 +9,7 @@ mod recovery;
 mod references;
 pub(crate) mod request;
 mod resets;
+mod search_history;
 
 use http::HeaderMap;
 use xxgate_core::{

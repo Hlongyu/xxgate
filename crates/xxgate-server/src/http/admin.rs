@@ -451,6 +451,7 @@ pub async fn save_settings(
     let _lock = s.gateway.mutations.lock().await;
     match s.gateway.store.save_settings(&input, input.version).await {
         Ok(next) => {
+            crate::logging::set_level(next.log_level);
             s.gateway.settings.publish(next.clone());
             s.gateway.scheduler.wake();
             Ok(Json(next))
@@ -458,6 +459,7 @@ pub async fn save_settings(
         Err(e) => {
             // A commit can succeed even if its acknowledgement was lost. Reconcile before returning.
             if let Ok(persisted) = s.gateway.store.settings().await {
+                crate::logging::set_level(persisted.log_level);
                 s.gateway.settings.publish(persisted);
                 s.gateway.scheduler.wake();
             } else {

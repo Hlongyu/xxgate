@@ -10,4 +10,6 @@ mod settings;
 
 pub use accounts::PgStore;
 
+#[cfg(test)]
+mod current_quotas_tests;
 mod model_version;
