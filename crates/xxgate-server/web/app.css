@@ -214,3 +214,63 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
 .account-subscription{display:block;margin-top:6px;font-size:11px;color:#526859;overflow-wrap:anywhere}
 
 .account-detail-actions{flex-wrap:wrap}.account-detail-actions button{flex:0 0 auto;white-space:nowrap}
+
+/* Request tracing keeps the query controls stable while refreshing compact results. */
+.requests-page>.page-head{margin-bottom:16px;gap:12px}
+.requests-page>.page-head h1{font-size:24px}
+.requests-page>.page-head .eyebrow{margin-bottom:5px}
+.requests-page>.page-head p{margin-top:5px}
+.requests-page>.page-head .actions{flex-wrap:wrap;justify-content:flex-end}
+#request-refresh-status{font-size:11px;color:var(--muted)}
+.requests-page .trace-filters{gap:9px 10px;padding:12px;margin-bottom:12px;border-radius:10px}
+.requests-page .trace-filters label{gap:4px}
+.requests-page .trace-filters input,.requests-page .trace-filters select{padding:7px 9px;border-radius:6px;min-width:105px;max-width:205px}
+.requests-page .trace-filters label:first-child{min-width:190px}
+.requests-page .trace-filters .wide{min-width:165px}
+.requests-page .trace-filters input[type=datetime-local]{min-width:195px;max-width:none}
+.request-query-actions{display:flex;align-items:center;gap:10px}
+.request-query-actions span{font-size:10px;color:var(--muted)}
+.requests-page .trace-session-scope{margin-bottom:10px}
+.request-cache-overview{margin-bottom:12px;border:1px solid var(--border);border-radius:8px;background:#fff}
+.request-cache-overview>summary{display:flex;align-items:center;gap:20px;padding:10px 14px;font-size:11px;list-style:none}
+.request-cache-overview>summary::-webkit-details-marker{display:none}
+.request-cache-overview>summary::before{content:'▸';color:var(--green)}
+.request-cache-overview[open]>summary::before{content:'▾'}
+.request-cache-overview>summary strong{color:var(--green);font-variant-numeric:tabular-nums}
+.request-cache-overview .cache-overview{border:0;border-top:1px solid var(--border);border-radius:0;margin:0;padding:16px 20px}
+.requests-page .request-panel{border-radius:10px;margin-bottom:12px}
+.requests-page .trace-list-head{padding:11px 14px;gap:10px}
+.requests-page .trace-list-head h2{font-size:13px}
+.requests-page .request-panel th{padding:9px 12px}
+.requests-page .request-panel td{padding:8px 12px}
+.requests-page .request-time time{font-size:11px;max-width:none;line-height:1.5}
+.requests-page .trace-request-id,.requests-page .trace-session-link{display:inline-flex;padding:2px 0!important}
+.requests-page .trace-session-link{margin-left:8px}
+.requests-page .trace-source-line{gap:4px;margin-bottom:4px}
+.requests-page .request-type,.requests-page .client-source{padding:2px 5px;border-radius:4px}
+.requests-page .request-model .name{margin-bottom:2px}
+.requests-page .cache-cell{min-width:125px;max-width:175px}
+.requests-page .cache-cell-value strong{font-size:17px}
+.requests-page .cache-cell-value svg{width:13px;height:13px}
+.requests-page .cache-track{height:3px;margin:4px 0}
+.requests-page .cache-note{line-height:1.4}
+.requests-page .trace-stack{gap:3px;margin-bottom:3px}
+.requests-page .trace-chip{padding:3px 5px;border-radius:4px;gap:4px}
+.requests-page .request-performance .request-cost{margin-bottom:3px;padding:3px 5px}
+.requests-page .trace-latency{margin-bottom:2px}
+.requests-page .request-performance{min-width:150px}
+.requests-page .request-panel .tag{padding:3px 7px}
+.requests-page .request-panel .account-name{margin-top:5px}
+.requests-page .pagination{margin-top:10px}
+@media(max-width:760px){
+ .requests-page>.page-head .actions{justify-content:flex-start}
+ .requests-page .trace-filters label{flex:1 1 140px;min-width:0}
+ .requests-page .trace-filters input,.requests-page .trace-filters select,.requests-page .trace-filters .wide,.requests-page .trace-filters input[type=datetime-local]{min-width:0;max-width:none;width:100%}
+ .request-cache-overview>summary{flex-wrap:wrap;gap:8px 12px}
+ .requests-page .request-panel tbody tr{padding:12px;gap:8px}
+ .requests-page .request-panel td{padding:0}
+ .requests-page .request-panel .request-account{padding-top:7px}
+ .requests-page .request-panel .request-account .account-name{margin-top:0}
+ .requests-page .request-performance{min-width:0}
+ .requests-page .request-panel .cache-cell{min-width:0;max-width:none}
+}

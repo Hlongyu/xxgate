@@ -1,7 +1,7 @@
 'use strict';
 const $ = s => document.querySelector(s);
 const app = $('#app'), dialog = $('#dialog');
-const state = {page:'dashboard', filter:{}, offset:0, auditOffset:0, models:[], prices:[], accounts:[], groups:[], keys:[], config:null};
+const state = {page:'dashboard', requestChartOpen:false, filter:requestTodayFilter(), offset:0, auditOffset:0, models:[], prices:[], accounts:[], groups:[], keys:[], config:null};
 const icons = {
  errors:'<path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3h.01"/>',
  cache:'<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 4 16 4 16 0V5M4 12v7c0 4 16 4 16 0v-7"/>',
@@ -77,12 +77,20 @@ async function render(quiet=false){
   const loaders={dashboard:dashboardPage,accounts:accountsPage,groups:groupsPage,requests:requestsPage,errors:ErrorCenter.page,usage:usagePage,models:modelsPage,keys:keysPage,settings:settingsPage,audit:auditPage};
   const content=await loaders[page](read);
   if(state.auth&&pageLoad===controller&&state.page===page){
-   if(quiet&&(dialog.open||billingTip||document.querySelector('main input:focus,main select:focus')))return;
+   if(quiet&&(dialog.open||billingTip||(page!=='requests'&&document.querySelector('main input:focus,main select:focus'))))return;
    const html=content+(['accounts','groups'].includes(page)?'':footer());
-   if(html!==lastPageContent){$('#main').innerHTML=html;lastPageContent=html;}
+   if(html!==lastPageContent){
+    if(quiet&&page==='requests'&&$('#request-results')){
+     const template=document.createElement('template');template.innerHTML=content;
+     const results=template.content.querySelector('#request-results');
+     if(results)replaceRequestResults(results.innerHTML);
+    }else $('#main').innerHTML=html;
+    lastPageContent=html;
+   }
+   if(page==='requests'&&$('#request-refresh-status'))$('#request-refresh-status').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
    $('#updated').textContent=new Date().toLocaleTimeString('zh-CN',{hour12:false});
   }
- }catch(e){if(e.name!=='AbortError'&&!quiet&&state.auth&&pageLoad===controller){$('#main').innerHTML=head(title,'')+`<div class="notice error" role="alert">${esc(e.message)} · 可点击刷新重试。</div>`;}}
+ }catch(e){if(e.name!=='AbortError'&&quiet&&state.auth&&pageLoad===controller&&page==='requests'&&$('#request-refresh-status'))$('#request-refresh-status').textContent='刷新失败，请重试';if(e.name!=='AbortError'&&!quiet&&state.auth&&pageLoad===controller){$('#main').innerHTML=head(title,'')+`<div class="notice error" role="alert">${esc(e.message)} · 可点击刷新重试。</div>`;}}
  finally{if(pageLoad===controller)pageLoad=null;}
 }
 function navigate(page){state.page=page;document.querySelectorAll('[data-page]').forEach(x=>x.classList.toggle('active',x.dataset.page===page));location.hash=page;render();}
@@ -237,9 +245,43 @@ function requestRows(items){return items.map(r=>{
  const search=r.kind==='search',u=r.usage||{},m=CacheMetrics.compare(r),factor=billingFactor(r),fast=['fast','priority'].includes(u.service_tier),tps=tokensPerSecond(r),first=firstTokenMs(r);
  return `<tr class="clickable ${m.drop?'cache-drop-row':''}" data-action="request-detail" data-id="${r.id}"><td class="request-time"><time datetime="${esc(r.created_at)}">${dt(r.created_at)}</time><button class="trace-request-id ghost" data-action="request-detail" data-id="${r.id}" title="${r.id}">${icon('requests')}${short(r.id)}${icon('arrow')}</button>${r.client_session_id?`<button class="trace-session-link ghost" data-action="request-session" data-session="${esc(r.client_session_id)}" data-key="${r.key_id}" title="${esc(r.client_session_id)}">${icon('activity')}此会话</button>`:''}</td><td class="request-model"><div class="trace-source-line">${requestType(r)}${clientSource(r)}</div><div class="mono name">${esc(r.model)}</div><span class="cache-note">${search?'按成功次数计费':'思考 · '+reasoningLabel(r.reasoning_effort)}</span></td><td class="request-cache">${cacheCell(r)}</td><td class="request-tokens"><div class="trace-stack">${search?traceChip('成功',n(u.search_calls)+' 次','check'):traceChip('输入',u.input_tokens==null?'未知':n(u.input_tokens),'download')+traceChip('输出',u.output_tokens==null?'未知':n(u.output_tokens),'arrow')}</div>${!search?`<span class="cache-note">缓存输入 ${u.cached_input_tokens==null?'未知':n(u.cached_input_tokens)}</span>`:''}</td><td class="request-performance"><span class="request-cost trace-chip" data-billing tabindex="0" aria-label="查看计费详情" aria-describedby="billing-tooltip">${icon('wallet')}<b>${r.valuation?.cny==null?'未计价':'¥ '+money(r.valuation.cny)}</b>${!search&&fast&&factor!=null?`<span class="fast-badge" aria-label="Fast 计费倍率 ${esc(Number(factor))}">×${esc(Number(factor))}</span>`:''}<template>${billingTooltip(r)}</template></span><div class="trace-latency">${icon('clock')}<span>总计 <b>${ms(r.total_ms)}</b></span></div><span class="cache-note" title="首字包含排队；TPS = 输出 Token ÷ 总耗时">${search?'Search':'首字 '+ms(first)+' · '+(tps==null?'—':tps.toLocaleString('zh-CN',{maximumFractionDigits:1}))+' t/s'}</span></td><td class="request-account">${tag(r.state)}<span class="account-name" title="${esc(r.account_name||'')}">${icon('accounts')}${esc(r.account_name||(r.account_id?'账户不可用':'—'))}</span></td></tr>`;
 });}
+function requestTodayFilter(now=new Date()){
+ const from=new Date(now);from.setHours(0,0,0,0);
+ const to=new Date(from);to.setDate(to.getDate()+1);
+ return {from:from.toISOString(),to:to.toISOString()};
+}
+function requestLocalTime(value){
+ if(!value)return '';
+ const date=new Date(value);if(!Number.isFinite(date.getTime()))return '';
+ return new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,19);
+}
+function requestFilter(values){
+ const filter={};
+ for(const key of ['kind','state','model','session_id','client_source'])if(values[key]?.trim())filter[key]=values[key].trim();
+ if(values.lookup?.trim()&&['id','account_id','key_id'].includes(values.lookup_kind))filter[values.lookup_kind]=values.lookup.trim();
+ for(const key of ['from','to'])if(values[key]){
+  const date=new Date(values[key]);
+  if(!Number.isFinite(date.getTime()))throw new Error('请输入有效的开始和结束时间');
+  filter[key]=date.toISOString();
+ }
+ if(filter.from&&filter.to&&Date.parse(filter.from)>=Date.parse(filter.to))throw new Error('结束时间必须晚于开始时间');
+ return filter;
+}
+function replaceRequestResults(html){
+ const current=$('#request-results');if(!current||current.innerHTML===html)return;
+ const scrollLeft=current.querySelector('.table-wrap')?.scrollLeft||0;
+ current.innerHTML=html;
+ const table=current.querySelector('.table-wrap');if(table)table.scrollLeft=scrollLeft;
+}
+function requestResults(d){
+ const visible=state.cacheDropsOnly?d.items.filter(r=>CacheMetrics.compare(r).drop):d.items;
+ return `${state.filter.session_id?`<div class="trace-session-scope">${icon('activity')}<span>会话</span><code>${esc(state.filter.session_id)}</code>${state.filter.key_id?`<small>Key ${short(state.filter.key_id)}</small>`:''}</div>`:''}${d.items.some(r=>r.kind!=='search')?`<details class="request-cache-overview" data-request-chart ${state.requestChartOpen?'open':''}><summary><span>缓存趋势</span><span>加权命中率 <strong>${cachePercent(CacheMetrics.summarize(d.items).rate)}</strong></span><span>明显下降 ${CacheMetrics.summarize(d.items).drops} 次</span></summary>${cacheOverview(d.items)}</details>`:''}<section class="panel request-panel"><div class="trace-list-head"><h2>${state.cacheDropsOnly?'明显下降 · 本页':'请求记录'}</h2><span>${icon('requests')}${n(d.total)} 条匹配 · 最新在前</span>${state.cacheDropsOnly?'<button class="small ghost" data-action="cache-drops">显示全部</button>':''}</div>${visible.length?table(['请求','接口与模型','缓存命中率','用量','费用与耗时','状态与账户'],requestRows(visible)):empty(state.cacheDropsOnly?'本页没有明显下降':'没有匹配的请求',state.cacheDropsOnly?'可切换其他页，或显示全部本页请求。':'调整筛选条件，或通过 API 发起请求。')}</section><div class="pagination"><span>共 ${n(d.total)} 条 · 第 ${Math.floor(state.offset/25)+1} 页</span><div><button class="small" data-action="request-prev" ${state.offset?'':'disabled'}>上一页</button><button class="small" data-action="request-next" ${state.offset+25<d.total?'':'disabled'}>下一页</button></div></div>`;
+}
 async function requestsPage(api){
- const p=new URLSearchParams({...state.filter,offset:state.offset,limit:25}),d=await api('/requests?'+p),visible=state.cacheDropsOnly?d.items.filter(r=>CacheMetrics.compare(r).drop):d.items;
- return head('请求追踪','查看缓存复用，定位每一次调用。')+`<form class="filters trace-filters" data-form="filter"><label>会话 ID<input name="session_id" class="wide" value="${esc(state.filter.session_id)}" placeholder="客户端 session_id"></label><label>客户端来源<select name="client_source"><option value="">全部来源</option><option value="codex" ${state.filter.client_source==='codex'?'selected':''}>Codex</option><option value="unknown" ${state.filter.client_source==='unknown'?'selected':''}>未知来源</option></select></label><label>接口<select name="kind"><option value="">全部接口</option><option value="responses" ${state.filter.kind==='responses'?'selected':''}>Responses</option><option value="compact" ${state.filter.kind==='compact'?'selected':''}>Compact</option><option value="search" ${state.filter.kind==='search'?'selected':''}>Search</option><option value="image_generation" ${state.filter.kind==='image_generation'?'selected':''}>图片生成</option><option value="image_edit" ${state.filter.kind==='image_edit'?'selected':''}>图片编辑</option></select></label><label>状态<select name="state"><option value="">全部状态</option>${['queued','inflight','completed','failed','cancelled','interrupted','rejected'].map(x=>`<option ${state.filter.state===x?'selected':''} value="${x}">${label(x)}</option>`).join('')}</select></label><label>模型<input name="model" value="${esc(state.filter.model)}" placeholder="模型名称"></label><label>请求 / 账户 / Key ID<input name="lookup" class="wide" value="${esc(state.filter.id||state.filter.account_id||state.filter.key_id)}" placeholder="完整 UUID"></label><label>查找类型<select name="lookup_kind">${[['id','请求'],['account_id','账户'],['key_id','Key']].map(([k,v])=>`<option value="${k}" ${state.filter[k]?'selected':''}>${v}</option>`).join('')}</select></label><button class="primary" type="submit">筛选</button><button type="button" data-action="filter-reset" class="ghost">重置</button></form>${state.filter.session_id?`<div class="trace-session-scope">${icon('activity')}<span>会话</span><code>${esc(state.filter.session_id)}</code>${state.filter.key_id?`<small>Key ${short(state.filter.key_id)}</small>`:''}</div>`:''}${d.items.some(r=>r.kind!=='search')?cacheOverview(d.items):''}<section class="panel request-panel"><div class="trace-list-head"><h2>${state.cacheDropsOnly?'明显下降 · 本页':'请求记录'}</h2><span>${icon('requests')}${n(d.total)} 条匹配 · 最新在前</span>${state.cacheDropsOnly?'<button class="small ghost" data-action="cache-drops">显示全部</button>':''}</div>${visible.length?table(['请求','接口与模型','缓存命中率','用量','费用与耗时','状态与账户'],requestRows(visible)):empty(state.cacheDropsOnly?'本页没有明显下降':'没有匹配的请求',state.cacheDropsOnly?'可切换其他页，或显示全部本页请求。':'调整筛选条件，或通过 API 发起请求。')}</section><div class="pagination"><span>共 ${n(d.total)} 条 · 第 ${Math.floor(state.offset/25)+1} 页</span><div><button class="small" data-action="request-prev" ${state.offset?'':'disabled'}>上一页</button><button class="small" data-action="request-next" ${state.offset+25<d.total?'':'disabled'}>下一页</button></div></div>`;
+ const p=new URLSearchParams({...state.filter,offset:state.offset,limit:25}),d=await api('/requests?'+p);
+ state.requestResult=d;
+ const refresh='<span id="request-refresh-status" role="status"></span>';
+ return '<div class="requests-page">'+head('请求追踪','查询结果保持不变，点击查询或刷新获取最新记录。',refresh)+`<form class="filters trace-filters" data-form="filter"><label>会话 ID<input name="session_id" class="wide" value="${esc(state.filter.session_id)}" placeholder="客户端 session_id"></label><label>客户端来源<select name="client_source"><option value="">全部来源</option><option value="codex" ${state.filter.client_source==='codex'?'selected':''}>Codex</option><option value="unknown" ${state.filter.client_source==='unknown'?'selected':''}>未知来源</option></select></label><label>接口<select name="kind"><option value="">全部接口</option><option value="responses" ${state.filter.kind==='responses'?'selected':''}>Responses</option><option value="compact" ${state.filter.kind==='compact'?'selected':''}>Compact</option><option value="search" ${state.filter.kind==='search'?'selected':''}>Search</option><option value="image_generation" ${state.filter.kind==='image_generation'?'selected':''}>图片生成</option><option value="image_edit" ${state.filter.kind==='image_edit'?'selected':''}>图片编辑</option></select></label><label>状态<select name="state"><option value="">全部状态</option>${['queued','inflight','completed','failed','cancelled','interrupted','rejected'].map(x=>`<option ${state.filter.state===x?'selected':''} value="${x}">${label(x)}</option>`).join('')}</select></label><label>模型<input name="model" value="${esc(state.filter.model)}" placeholder="模型名称"></label><label>请求 / 账户 / Key ID<input name="lookup" class="wide" value="${esc(state.filter.id||state.filter.account_id||state.filter.key_id)}" placeholder="完整 UUID"></label><label>查找类型<select name="lookup_kind">${[['id','请求'],['account_id','账户'],['key_id','Key']].map(([k,v])=>`<option value="${k}" ${state.filter[k]?'selected':''}>${v}</option>`).join('')}</select></label><label>开始时间（含）<input type="datetime-local" step="1" name="from" value="${requestLocalTime(state.filter.from)}"></label><label>结束时间（不含）<input type="datetime-local" step="1" name="to" value="${requestLocalTime(state.filter.to)}"></label><div class="request-query-actions"><button class="primary" type="submit">查询</button><span>按本地时区</span></div><button type="button" data-action="filter-reset" class="ghost">重置</button></form><div id="request-results">${requestResults(d)}</div></div>`;
 }
 async function modelsPage(api){
  const [m,p,d,j,sp]=await Promise.all([api('/models'),api('/prices'),api('/models/discovered'),api('/models/sync'),api('/search-price')]);state.searchPrice=sp;state.models=m.items;state.prices=p.items;state.discovered=d.items;state.modelSyncRunning=j.running;
@@ -424,7 +466,7 @@ document.addEventListener('click',async event=>{
  try{
   if(a==='close')return close();
   if(a==='refresh'&&state.page==='errors')ErrorCenter.refresh();
-  if(a==='refresh')return render();
+  if(a==='refresh')return render(state.page==='requests'&&!!$('#request-results'));
   if(a==='logout'){await api('/logout','POST');return loginPage();}
   if(a==='account-delete'||a==='key-delete'){
    const account=a==='account-delete',item=account?state.accounts.find(x=>x.account.id===id)?.account:state.keys.find(x=>x.id===id);
@@ -451,13 +493,13 @@ document.addEventListener('click',async event=>{
   if(a==='account-models-sync'){el.disabled=true;await api('/accounts/'+id+'/models/sync','POST');toast('账户模型已更新');await accountDetail(id);return;}
   if(a?.startsWith('errors-'))return await ErrorCenter.action(a,el);
   if(a==='request-detail'){event.preventDefault();return await requestDetail(id);}
-  if(a==='cache-drops'){state.cacheDropsOnly=!state.cacheDropsOnly;return render();}
+  if(a==='cache-drops'){state.cacheDropsOnly=!state.cacheDropsOnly;if(state.requestResult)replaceRequestResults(requestResults(state.requestResult));return;}
   if(a==='request-session'){close();state.filter={session_id:el.dataset.session,key_id:el.dataset.key};state.offset=0;state.cacheDropsOnly=false;if(state.page==='requests'){await render();window.scrollTo(0,0);return;}return navigate('requests');}
   if(a==='key-create'||a==='key-edit')return await keyEdit(id);
   if(a==='oauth-link-copy'){await navigator.clipboard.writeText($('#oauth-link').value);return toast('授权链接已复制');}
   if(a==='key-copy'){await navigator.clipboard.writeText($('#new-key').textContent);return toast('已复制密钥');}
   if(a==='usage-reset'){state.usageFilter={};return render();}
-  if(a==='filter-reset'){state.filter={};state.cacheDropsOnly=false;state.offset=0;return render();}
+  if(a==='filter-reset'){state.filter=requestTodayFilter();state.cacheDropsOnly=false;state.offset=0;return render();}
   if(a==='request-prev'||a==='request-next'){state.offset=Math.max(0,state.offset+(a==='request-next'?25:-25));return render();}
   if(a==='audit-prev'||a==='audit-next'){state.auditOffset=Math.max(0,state.auditOffset+(a==='audit-next'?30:-30));return render();}
   el.disabled=true;
@@ -476,7 +518,7 @@ document.addEventListener('submit',async event=>{
   if(kind==='login'){await api('/login','POST',v);form.reset();return shell();}
   if(kind==='usage-filter'){state.usageFilter={};for(const [k,x] of Object.entries(v)){if(x)state.usageFilter[k]=['from','to'].includes(k)?new Date(x).toISOString():x;}return render();}
   if(kind==='error-filter')return await ErrorCenter.submit(v);
-  if(kind==='filter'){state.cacheDropsOnly=false;state.filter={};['kind','state','model','session_id','client_source'].forEach(k=>{if(v[k])state.filter[k]=v[k]});if(v.lookup)state.filter[v.lookup_kind]=v.lookup;state.offset=0;return render();}
+  if(kind==='filter'){const filter=requestFilter(v);state.filter=filter;state.cacheDropsOnly=false;state.offset=0;return render();}
   if(kind==='account-import'){const credentials=JSON.parse(v.credentials);await api('/accounts','POST',{name:v.name,credentials,upstream_account_id:v.upstream_account_id||null,upstream_base_url:v.upstream_base_url,group_ids:fd.getAll('group_id')});}
   if(kind==='account-edit'){const a=state.accountEditor;await api('/accounts/'+id,'PUT',{name:v.name,codex_only:fd.has('codex_only'),use_extra_credits:fd.has('use_extra_credits'),user_agent:v.user_agent,tls_backend:v.tls_backend,group_ids:fd.getAll('group_id'),version:a.version,max_inflight:Number(v.max_inflight),models:a.models,models_restricted:a.models_restricted||false});}
   if(kind==='account-models'){const a=state.modelEditor;await api('/accounts/'+id,'PUT',{version:a.version,name:a.name,max_inflight:a.max_inflight,models:fd.getAll('account_model'),models_restricted:true});}
@@ -509,7 +551,13 @@ document.addEventListener('submit',async event=>{
  }catch(e){if(error)error.textContent=e.message;else toast(e.message);}finally{if(button)button.disabled=false;}
 });
 window.addEventListener('hashchange',()=>{const page=location.hash.slice(1);if(pages.some(p=>p[0]===page)&&page!==state.page)navigate(page);});
-setInterval(()=>{if(state.auth&&!document.hidden&&!dialog.open&&(['dashboard','accounts','requests'].includes(state.page)||(state.page==='models'&&state.modelSyncRunning))&&!document.querySelector('main input:focus,main select:focus'))render(true);},10000);
+function refreshCurrentPage(){
+ if(!state.auth||document.hidden||dialog.open||state.page==='requests')return;
+ if((['dashboard','accounts'].includes(state.page)||(state.page==='models'&&state.modelSyncRunning))&&!document.querySelector('main input:focus,main select:focus'))return render(true);
+}
+setInterval(refreshCurrentPage,10000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshCurrentPage();});
+document.addEventListener('toggle',event=>{if(event.target.matches?.('[data-request-chart]'))state.requestChartOpen=event.target.open;},true);
 (async()=>{try{await api('/session');const page=location.hash.slice(1);if(pages.some(p=>p[0]===page))state.page=page;shell();}catch{loginPage();}})();
 
 function originalUpstreamError(r){
