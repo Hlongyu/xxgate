@@ -33,15 +33,36 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 node --test crates/xxgate-server/web/tests/*.test.cjs
 
-docker buildx build --platform linux/amd64 --load \
+docker buildx build --pull --no-cache --platform linux/amd64 --load \
   -t local/xxgate:<tag> .
+docker run --rm -i --platform linux/amd64 --read-only --entrypoint sh \
+  local/xxgate:<tag> -s < scripts/check-release-certificates.sh
 docker save local/xxgate:<tag> | gzip > xxgate-image.tar.gz
 shasum -a 256 xxgate-image.tar.gz > xxgate-image.tar.gz.sha256
 ```
 
-将 `<tag>` 替换为本次发布的唯一标记。先在开发机用隔离配置验证镜像启动、管理接口和静态资源，再传输成品镜像、校验文件及部署配置。生产主机只执行 SHA-256 校验、`docker load`、候选检查、备份和 `up --no-build`。
+将 `<tag>` 替换为本次发布的唯一标记。发布构建刷新基础镜像并重新安装系统软件包，避免复用过期的证书层。证书包检查必须通过后才能导出镜像；检查失败时停止发布。先在开发机用隔离配置验证镜像启动、管理接口和静态资源，再传输成品镜像、校验文件及部署配置。生产主机只执行 SHA-256 校验、`docker load`、候选检查、备份和 `up --no-build`。
 
 多阶段 Dockerfile 使用 Cargo.lock、Rust 1.96.0 和 Debian Bookworm；最终镜像只包含服务程序与运行依赖。程序以 UID/GID 10001 运行，根文件系统只读。构建参数 `RUST_BUILD_IMAGE` 和 `RUNTIME_IMAGE` 可指定对应基础镜像缓存。
+
+### 2026-10 eMudhra 证书安全更新
+
+采用上游修复，不在业务代码中维护证书黑名单或自定义校验规则。`Cargo.lock` 使用 `rustls-webpki 0.103.16`、`webpki-roots 1.0.11` 和 `webpki-root-certs 1.0.11`：前者拒绝含已泄露公钥的证书链，两套根证书库跟进上游信任列表更新。参见 [校验库公告](https://rustsec.org/advisories/RUSTSEC-2026-0382)、[根证书库公告](https://rustsec.org/advisories/RUSTSEC-2026-0381)、[完整证书库公告](https://rustsec.org/advisories/RUSTSEC-2026-0383)和 [1.0.11 发布说明](https://github.com/rustls/webpki-roots/releases/tag/v%2F1.0.11)。更新依赖后必须重新编译，重启旧二进制不会获得修复。
+
+XXGate 的 native-tls 和部分客户端使用系统证书库；订阅查询的 wreq 默认使用独立内置的 `webpki-root-certs`，SQLx 使用 `webpki-roots`。系统证书包升级不能代替内置根证书库升级。Dockerfile 正常安装官方 `ca-certificates` 包，发行版专用最低版本要求由 `scripts/check-release-certificates.sh` 在发布镜像中检查：当前 Bookworm 要求 `ca-certificates >= 20250419~deb12u2`（[Debian 更新记录](https://tracker.debian.org/news/1813406/accepted-ca-certificates-20250419deb12u2-source-into-oldstable-security/)）。脚本同时检查系统 CA 文件可读且非空；它不验证二进制内置根证书版本，也不能替代真实 TLS 测试。更换基础发行版时需按该发行版公告更新检查。直接运行二进制的环境还需要更新宿主系统证书库。
+
+本机使用 Apple `container` 时，可用相同 Dockerfile 构建 amd64 镜像并导出 OCI 归档：
+
+```sh
+container build --platform linux/amd64 --cpus 4 --memory 6G \
+  --pull --no-cache --progress plain -t local/xxgate:<tag> .
+container run --rm -i --platform linux/amd64 --read-only --entrypoint sh \
+  local/xxgate:<tag> -s < scripts/check-release-certificates.sh
+container image save --platform linux/amd64 \
+  -o xxgate-image.tar local/xxgate:<tag>
+gzip xxgate-image.tar
+shasum -a 256 xxgate-image.tar.gz > xxgate-image.tar.gz.sha256
+```
 
 ## 初始化配置
 

@@ -5,7 +5,7 @@ ARG CARGO_BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake pkg-config libssl-dev perl clang libclang-dev \
+    && apt-get install -y --no-install-recommends ca-certificates cmake pkg-config libssl-dev perl clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
