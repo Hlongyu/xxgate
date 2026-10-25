@@ -10,6 +10,7 @@ mod references;
 pub(crate) mod request;
 mod resets;
 mod search_history;
+pub mod subscription;
 
 use http::HeaderMap;
 use xxgate_core::{

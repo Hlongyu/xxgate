@@ -93,6 +93,9 @@ impl UpstreamTransport for HttpTransport {
         request: PreparedRequest,
         cancel: CancellationToken,
     ) -> Result<UpstreamResponse> {
+        if request.tls_backend == "subscription_browser" {
+            return browser_subscription(request, cancel).await;
+        }
         let client = self.client(&request)?;
         let future = client
             .request(request.method, &request.url)
@@ -112,6 +115,56 @@ impl UpstreamTransport for HttpTransport {
             bytes: Box::pin(stream),
         })
     }
+}
+
+// Isolated from the Codex Responses clients: browser TLS/HTTP2 profile, no
+// cookies, redirects or retries, and only two read-only official endpoints.
+async fn browser_subscription(
+    request: PreparedRequest,
+    cancel: CancellationToken,
+) -> Result<UpstreamResponse> {
+    let url =
+        url::Url::parse(&request.url).map_err(|_| Error::invalid("Invalid subscription URL"))?;
+    if request.method != http::Method::GET
+        || url.origin().ascii_serialization() != "https://chatgpt.com"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(
+            url.path(),
+            "/backend-api/subscriptions" | "/backend-api/accounts/check/v4-2023-04-27"
+        )
+    {
+        return Err(Error::invalid("Unsupported subscription endpoint"));
+    }
+    let client = wreq::Client::builder()
+        .emulation(wreq_util::Emulation::Chrome147)
+        .redirect(wreq::redirect::Policy::none())
+        .retry(wreq::retry::Policy::never())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            Error::new(
+                500,
+                "subscription_client_failed",
+                "无法初始化套餐查询客户端",
+            )
+        })?;
+    let future = client.get(url.as_str()).headers(request.headers).send();
+    let response = tokio::select! { biased; _=cancel.cancelled()=>return Err(Error::cancelled()), r=future=>r.map_err(|_| Error::new(502,"subscription_transport_failed","套餐查询连接失败，请稍后重试"))? };
+    Ok(UpstreamResponse {
+        status: response.status().as_u16(),
+        headers: response.headers().clone(),
+        bytes: Box::pin(
+            response
+                .bytes_stream()
+                .map(|r| {
+                    r.map_err(|_| {
+                        Error::new(502, "subscription_body_failed", "套餐查询响应读取失败")
+                    })
+                })
+                .take_until(cancel.cancelled_owned()),
+        ),
+    })
 }
 
 #[cfg(test)]

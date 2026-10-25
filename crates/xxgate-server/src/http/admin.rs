@@ -43,6 +43,22 @@ pub(super) async fn account_identity(
     Ok(xxgate_codex::provider::oauth::account_details(&credentials).ok())
 }
 
+async fn subscription_metadata(
+    s: &AppState,
+    id: Uuid,
+    identity: &Option<xxgate_codex::provider::oauth::AccountDetails>,
+) -> xxgate_core::Result<(Option<String>, Value)> {
+    if let Some(snapshot) = s.gateway.store.subscription(id).await? {
+        return Ok((Some(snapshot.plan_type.clone()), json!(snapshot)));
+    }
+    let plan = identity.as_ref().and_then(|d| d.plan_type.clone());
+    let mut snapshot = json!(identity.as_ref().and_then(|d| d.subscription.as_ref()));
+    if snapshot.is_object() {
+        snapshot["source"] = json!("token_claims");
+    }
+    Ok((plan, snapshot))
+}
+
 pub async fn delete_account(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
@@ -96,7 +112,8 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
             .await?;
         let resets = super::resets::view(&s, account.id).await?;
         let identity = account_identity(&s, account.id).await?;
-        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":account,"quotas":windows,"extra_credits":extra_credits_view(&s, account.id).await?,"spending":spending,"resets":resets}));
+        let (plan, subscription) = subscription_metadata(&s, account.id, &identity).await?;
+        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":account,"quotas":windows,"extra_credits":extra_credits_view(&s, account.id).await?,"spending":spending,"resets":resets}));
     }
     Ok(Json(
         json!({"items":items,"runtime":s.gateway.scheduler.stats()}),
@@ -112,8 +129,9 @@ pub async fn account_detail(
         .account(id)
         .ok_or_else(Error::not_found)?;
     let identity = account_identity(&s, id).await?;
+    let (plan, subscription) = subscription_metadata(&s, id, &identity).await?;
     Ok(Json(
-        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":identity.as_ref().and_then(|d|d.plan_type.as_ref()),"account":a,"quotas":s.gateway.store.quotas(id).await?,"extra_credits":extra_credits_view(&s,id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
+        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":a,"quotas":s.gateway.store.quotas(id).await?,"extra_credits":extra_credits_view(&s,id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
     ))
 }
 #[derive(Deserialize)]

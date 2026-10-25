@@ -210,3 +210,7 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
 .cycle-usage>.partial-mark:before{content:none}
 
 .cycle-usage small{font-size:inherit;color:#8b978e}
+
+.account-subscription{display:block;margin-top:6px;font-size:11px;color:#526859;overflow-wrap:anywhere}
+
+.account-detail-actions{flex-wrap:wrap}.account-detail-actions button{flex:0 0 auto;white-space:nowrap}

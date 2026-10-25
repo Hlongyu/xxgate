@@ -42,6 +42,13 @@ pub trait AccountStore: Send + Sync {
         expected_version: i64,
         actor: &str,
     ) -> Result<Account>;
+    async fn subscription(&self, id: Uuid)
+    -> Result<Option<crate::accounts::SubscriptionSnapshot>>;
+    async fn save_subscription(
+        &self,
+        account: &Account,
+        snapshot: &crate::accounts::SubscriptionSnapshot,
+    ) -> Result<()>;
     async fn extra_credits(&self, id: Uuid) -> Result<Option<crate::quota::ExtraCredits>>;
     async fn save_extra_credits(
         &self,

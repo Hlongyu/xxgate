@@ -21,6 +21,13 @@ tower.workspace = true
 tracing.workspace = true
 url.workspace = true
 
+wreq = { version = "=6.0.0-rc.31", features = ["stream", "gzip", "brotli", "deflate"] }
+wreq-util = "=3.0.0-rc.14"
+
+# Linux also links OpenSSL for the existing native transport.
+[target.'cfg(target_os = "linux")'.dependencies]
+wreq = { version = "=6.0.0-rc.31", features = ["prefix-symbols"] }
+
 [dev-dependencies]
 axum.workspace = true
 

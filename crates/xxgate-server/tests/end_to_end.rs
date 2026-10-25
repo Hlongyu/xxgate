@@ -86,6 +86,8 @@ struct TestTransport {
     http: HttpTransport,
     device_calls: AtomicUsize,
     browser_calls: Arc<AtomicUsize>,
+    subscription_mode: Arc<AtomicUsize>,
+    subscription_calls: Arc<AtomicUsize>,
 }
 #[async_trait::async_trait]
 impl UpstreamTransport for TestTransport {
@@ -94,6 +96,48 @@ impl UpstreamTransport for TestTransport {
         request: PreparedRequest,
         cancel: CancellationToken,
     ) -> xxgate_core::Result<UpstreamResponse> {
+        if request.url == "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+            || request
+                .url
+                .starts_with("https://chatgpt.com/backend-api/subscriptions?")
+        {
+            assert_eq!(request.method, http::Method::GET);
+            assert_eq!(request.tls_backend, "subscription_browser");
+            assert!(request.headers.contains_key("authorization"));
+            assert!(request.body.is_empty());
+            self.subscription_calls.fetch_add(1, Ordering::SeqCst);
+            let mode = self.subscription_mode.load(Ordering::SeqCst);
+            let mut headers = HeaderMap::new();
+            let (status, body) = if mode == 1 {
+                headers.insert("cf-mitigated", "challenge".parse().unwrap());
+                (403, json!({"error":"PRIVATE_UPSTREAM_ERROR"}))
+            } else if mode == 2 {
+                (401, json!({"error":"PRIVATE_UPSTREAM_ERROR"}))
+            } else if mode == 3 {
+                (200, json!({"private":"PRIVATE_UPSTREAM_ERROR"}))
+            } else if request.url.ends_with("/accounts/check/v4-2023-04-27") {
+                (
+                    200,
+                    json!({"accounts":{"workspace":{"account":{"account_id":"another-workspace","plan_type":"team"},"entitlement":{"expires_at":"2040-01-01T00:00:00Z"}},"default":{"account":{"account_id":"browser-oauth-account","plan_type":if mode==4 {"free"} else {"pro"}},"entitlement":{"expires_at":null}}}}),
+                )
+            } else {
+                assert_eq!(
+                    request.url,
+                    "https://chatgpt.com/backend-api/subscriptions?account_id=browser-oauth-account"
+                );
+                (
+                    200,
+                    json!({"plan_type":"pro","active_until":"2032-01-01T00:00:00Z","will_renew":false,"id":"subscription-id"}),
+                )
+            };
+            return Ok(UpstreamResponse {
+                status,
+                headers,
+                bytes: Box::pin(futures::stream::once(async move {
+                    Ok(bytes::Bytes::from(body.to_string()))
+                })),
+            });
+        }
         if request.url == "https://auth.openai.com/api/accounts/deviceauth/usercode" {
             let first = self.device_calls.fetch_add(1, Ordering::SeqCst) == 0;
             let body = if first {
@@ -116,6 +160,22 @@ impl UpstreamTransport for TestTransport {
             });
         }
         if request.url == "https://auth.openai.com/oauth/token" {
+            if let Ok(payload) = serde_json::from_slice::<Value>(&request.body)
+                && payload["grant_type"] == "refresh_token"
+            {
+                assert_eq!(payload["refresh_token"], "PRIVATE_BROWSER_REFRESH");
+                self.browser_calls.fetch_add(1, Ordering::SeqCst);
+                use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+                let claims=URL_SAFE_NO_PAD.encode(json!({"https://api.openai.com/auth":{"chatgpt_account_id":"browser-oauth-account","chatgpt_plan_type":"pro","chatgpt_subscription_active_until":"2030-01-01T00:00:00Z","chatgpt_subscription_last_checked":"2026-10-16T00:00:00Z"}}).to_string());
+                let body = json!({"access_token":format!("header.{claims}.signature"),"id_token":format!("header.{claims}.signature"),"expires_in":3600});
+                return Ok(UpstreamResponse {
+                    status: 200,
+                    headers: HeaderMap::new(),
+                    bytes: Box::pin(futures::stream::once(async move {
+                        Ok(Bytes::from(body.to_string()))
+                    })),
+                });
+            }
             self.browser_calls.fetch_add(1, Ordering::SeqCst);
             let form = url::form_urlencoded::parse(&request.body)
                 .collect::<std::collections::HashMap<_, _>>();
@@ -593,6 +653,8 @@ async fn real_http_postgres_gateway_contract() {
     .await;
     let browser_calls = Arc::new(AtomicUsize::new(0));
     let counted_browser = browser_calls.clone();
+    let subscription_mode = Arc::new(AtomicUsize::new(0));
+    let subscription_calls = Arc::new(AtomicUsize::new(0));
     let memory_probe = Arc::new(memory_contract::Probe::default());
     let gateway = Gateway::new_with_memory_probe(
         store.clone(),
@@ -604,6 +666,8 @@ async fn real_http_postgres_gateway_contract() {
                 http: HttpTransport::new(s, true),
                 device_calls: AtomicUsize::new(0),
                 browser_calls: counted_browser,
+                subscription_mode: subscription_mode.clone(),
+                subscription_calls: subscription_calls.clone(),
             })
         },
         memory_probe.clone(),
@@ -734,6 +798,96 @@ async fn real_http_postgres_gateway_contract() {
     assert_eq!(result["account"]["enabled"], false);
     assert_eq!(browser_calls.load(Ordering::SeqCst), 1);
     assert!(!result.to_string().contains("PRIVATE_BROWSER"));
+    let browser_account_id = result["account"]["id"].as_str().unwrap();
+    let refreshed = c
+        .admin(
+            &format!("/accounts/{browser_account_id}/refresh"),
+            "POST",
+            None,
+        )
+        .await;
+    assert!(!refreshed.to_string().contains("PRIVATE_"));
+    assert!(refreshed.get("subscription").is_none());
+    assert_eq!(browser_calls.load(Ordering::SeqCst), 2);
+    for _ in 0..2 {
+        let detail = c
+            .admin(&format!("/accounts/{browser_account_id}"), "GET", None)
+            .await;
+        assert_eq!(
+            detail["subscription"]["active_until"],
+            "2030-01-01T00:00:00Z"
+        );
+        let list = c.admin("/accounts", "GET", None).await;
+        let item = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["account"]["id"] == browser_account_id)
+            .unwrap();
+        assert_eq!(item["subscription"], detail["subscription"]);
+        assert_eq!(
+            browser_calls.load(Ordering::SeqCst),
+            2,
+            "Reading subscription metadata must not exchange tokens"
+        );
+    }
+    let subscription_path = format!("/accounts/{browser_account_id}/subscription/refresh");
+    let account_uuid = Uuid::parse_str(browser_account_id).unwrap();
+    let before_credentials = store.credentials(account_uuid).await.unwrap();
+    assert_eq!(subscription_calls.load(Ordering::SeqCst), 0);
+    let live = c.admin(&subscription_path, "POST", None).await;
+    assert_eq!(live["subscription"]["active_until"], "2032-01-01T00:00:00Z");
+    assert_eq!(live["subscription"]["will_renew"], false);
+    assert_eq!(subscription_calls.load(Ordering::SeqCst), 2);
+    for (mode, code) in [
+        (1, "subscription_cloudflare_challenge"),
+        (2, "subscription_auth_expired"),
+        (3, "subscription_invalid_response"),
+    ] {
+        subscription_mode.store(mode, Ordering::SeqCst);
+        let failure = c
+            .http
+            .post(format!("{}/api/admin{}", c.base, subscription_path))
+            .header("x-xxgate-csrf", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failure.status(), 502);
+        let failure: Value = failure.json().await.unwrap();
+        assert_eq!(failure["error"]["code"], code);
+        assert!(!failure.to_string().contains("PRIVATE_"));
+        let detail = c
+            .admin(&format!("/accounts/{browser_account_id}"), "GET", None)
+            .await;
+        assert_eq!(detail["subscription"], live["subscription"]);
+    }
+    assert_eq!(
+        store.credentials(account_uuid).await.unwrap(),
+        before_credentials
+    );
+    assert_eq!(
+        browser_calls.load(Ordering::SeqCst),
+        2,
+        "Subscription refresh must never rotate tokens"
+    );
+    // Failed optimistic writes must preserve the previous successful snapshot.
+    let mut stale = gateway.scheduler.account(account_uuid).unwrap();
+    stale.credential_version -= 1;
+    let snapshot = store.subscription(account_uuid).await.unwrap().unwrap();
+    assert!(store.save_subscription(&stale, &snapshot).await.is_err());
+    subscription_mode.store(4, Ordering::SeqCst);
+    let free = c.admin(&subscription_path, "POST", None).await;
+    assert_eq!(free["subscription"]["plan_type"], "free");
+    assert!(free["subscription"]["active_until"].is_null());
+    let detail = c
+        .admin(&format!("/accounts/{browser_account_id}"), "GET", None)
+        .await;
+    assert_eq!(
+        detail["plan_type"], "free",
+        "Live plan takes precedence over old JWT claims"
+    );
+    assert_eq!(detail["subscription"], free["subscription"]);
+    subscription_mode.store(0, Ordering::SeqCst);
     let audit = c.admin("/audit?limit=100", "GET", None).await;
     assert!(!audit.to_string().contains("PRIVATE_BROWSER"));
     assert!(!audit.to_string().contains(&state));

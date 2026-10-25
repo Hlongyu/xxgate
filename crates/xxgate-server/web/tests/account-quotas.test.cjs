@@ -2,6 +2,15 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const q=require('../account-quotas.js');
 const window=(minutes,time='2026-09-22T00:00:00Z',pool='codex')=>({window:{pool,window_minutes:minutes,observed_at:time}});
+test('subscription snapshots distinguish missing, Free and past dates without declaring expiry',()=>{
+ const now=Date.parse('2026-10-16T00:00:00Z');
+ assert.equal(q.subscriptionState('pro',null,now).status,'unknown');
+ assert.equal(q.subscriptionState('pro',{active_until:'invalid'},now).status,'unknown');
+ assert.equal(q.subscriptionState('free',{active_until:'2030-01-01T00:00:00Z'},now).status,'not_applicable');
+ const past={active_until:'2026-09-30T00:00:00Z',last_checked_at:'2026-09-23T00:00:00Z'};
+ assert.deepEqual(q.subscriptionState('pro',past,now),{status:'needs_verification',until:past.active_until,checked:past.last_checked_at});
+ assert.equal(q.subscriptionState('pro',{active_until:'2026-11-01T00:00:00Z'},now).status,'recorded');
+});
 test('Free uses the 30-day cycle, while Plus and Pro retain 5h and 7days',()=>{
  const spending={last_30d:{cny:'30'},last_5h:{cny:'5'},last_7d:{cny:'7'},monthly_estimate:{total_cny:'50'}};
  assert.deepEqual(q.periods('free',[window(43200)],spending),[{minutes:43200,label:'30days',period:spending.last_30d}]);

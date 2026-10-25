@@ -2,6 +2,12 @@
  'use strict';
  const plans={free:'Free',plus:'Plus',pro:'Pro',go:'Go',team:'Team',business:'Business',enterprise:'Enterprise',edu:'Edu'};
  function planLabel(plan){return Object.hasOwn(plans,plan)?plans[plan]:'套餐未知';}
+ function subscriptionState(plan,snapshot,now=Date.now()){
+  if(plan==='free')return {status:'not_applicable',until:null,checked:null};
+  const date=value=>typeof value==='string'&&Number.isFinite(Date.parse(value))?value:null;
+  const until=date(snapshot?.active_until),checked=date(snapshot?.last_checked_at);
+  return {status:!until?'unknown':Date.parse(until)<=now?'needs_verification':'recorded',until,checked};
+ }
  function windowLabel(minutes){return minutes===300?'5h':minutes>0&&minutes%1440===0?`${minutes/1440}days`:minutes>0?`${minutes} 分钟`:'未知';}
  function periods(plan,quotas,spending){
   const windows=(quotas||[]).map(q=>q.window||q).filter(w=>w.pool==='codex'&&[300,10080,43200].includes(w.window_minutes));
@@ -24,6 +30,6 @@
   const positive=c.balance==null||Number.isFinite(Number(c.balance))&&Number(c.balance)>0;
   return c.has_credits&&positive?'额外额度可用'+balance:'额外额度不可用'+balance;
  }
- const api={planLabel,windowLabel,periods,estimate,creditLabel};
+ const api={planLabel,windowLabel,periods,estimate,creditLabel,subscriptionState};
  if(typeof module==='object'&&module.exports)module.exports=api;else root.AccountQuotas=api;
 })(typeof globalThis==='undefined'?this:globalThis);

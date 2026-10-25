@@ -174,3 +174,14 @@ impl Credentials {
         Ok(())
     }
 }
+
+/// Last successful read of the upstream billing metadata. No credentials are stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionSnapshot {
+    pub upstream_account_id: String,
+    pub plan_type: String,
+    pub active_until: Option<DateTime<Utc>>,
+    pub will_renew: Option<bool>,
+    pub last_checked_at: DateTime<Utc>,
+    pub source: String,
+}

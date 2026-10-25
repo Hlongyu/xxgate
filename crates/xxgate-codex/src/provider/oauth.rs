@@ -135,6 +135,43 @@ pub struct AccountDetails {
     pub account_id: String,
     pub email: Option<String>,
     pub plan_type: Option<String>,
+    pub subscription: Option<SubscriptionDetails>,
+}
+
+/// An upstream authorization snapshot, not a live billing or renewal check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubscriptionDetails {
+    pub active_until: Option<DateTime<Utc>>,
+    pub last_checked_at: Option<DateTime<Utc>>,
+}
+
+fn auth_claim<'a>(claims: &'a Value, field: &str) -> Option<&'a Value> {
+    claims
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.get(field))
+        .or_else(|| claims.get(field))
+}
+
+fn subscription_details(claims: &[&Value], plan: Option<&str>) -> Option<SubscriptionDetails> {
+    let plan = plan.filter(|plan| *plan != "free")?;
+    // Newer explicit nulls must invalidate old subscription dates. Never borrow
+    // expiry from another account or a previous subscription tier.
+    let snapshot = claims.iter().rev().find(|v| {
+        auth_claim(v, "chatgpt_plan_type")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.eq_ignore_ascii_case(plan))
+            && auth_claim(v, "chatgpt_subscription_active_until").is_some()
+    })?;
+    let date = |field| {
+        auth_claim(snapshot, field)
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|at| at.with_timezone(&Utc))
+    };
+    Some(SubscriptionDetails {
+        active_until: date("chatgpt_subscription_active_until"),
+        last_checked_at: date("chatgpt_subscription_last_checked"),
+    })
 }
 pub fn account_details(c: &Credentials) -> Result<AccountDetails> {
     // Claims are used as upstream metadata, never as authorization for the administrator API.
@@ -150,27 +187,26 @@ pub fn account_details(c: &Credentials) -> Result<AccountDetails> {
         .iter()
         .filter(|v| claim_account_id(v) == Some(account_id))
         .collect();
+    // A refresh can replace the access token while retaining an older ID token.
+    let plan_type = matching
+        .iter()
+        .rev()
+        .find_map(|v| auth_claim(v, "chatgpt_plan_type").and_then(Value::as_str))
+        .map(str::to_ascii_lowercase)
+        .filter(|p| {
+            matches!(
+                p.as_str(),
+                "free" | "plus" | "pro" | "go" | "team" | "business" | "enterprise" | "edu"
+            )
+        });
+    let subscription = subscription_details(&matching, plan_type.as_deref());
     Ok(AccountDetails {
         account_id: account_id.into(),
         email: matching
             .iter()
             .find_map(|v| v.get("email").and_then(Value::as_str).map(str::to_owned)),
-        // A refresh can replace the access token while retaining an older ID token.
-        plan_type: matching
-            .iter()
-            .rev()
-            .find_map(|v| {
-                v.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
-                    .or_else(|| v.get("chatgpt_plan_type"))
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_ascii_lowercase)
-            .filter(|p| {
-                matches!(
-                    p.as_str(),
-                    "free" | "plus" | "pro" | "go" | "team" | "business" | "enterprise" | "edu"
-                )
-            }),
+        plan_type,
+        subscription,
     })
 }
 
@@ -191,6 +227,75 @@ mod identity_tests {
             "header.{}.signature",
             URL_SAFE_NO_PAD.encode(value.to_string())
         )
+    }
+
+    #[test]
+    fn subscription_dates_are_snapshots_not_token_expiry_or_guessed_renewals() {
+        let old = json!({"chatgpt_account_id":"a","chatgpt_plan_type":"pro",
+            "chatgpt_subscription_active_until":"2026-09-30T20:48:02+08:00",
+            "chatgpt_subscription_last_checked":"2026-09-23T00:19:25Z"});
+        let c = Credentials {
+            id_token: token(json!({"https://api.openai.com/auth":old})),
+            access_token: token(
+                json!({"chatgpt_account_id":"a","chatgpt_plan_type":"pro","exp":2000000000}),
+            ),
+            refresh_token: "refresh".into(),
+            expires_at: DateTime::from_timestamp(2000000000, 0),
+        };
+        let before = account_details(&c).unwrap().subscription.unwrap();
+        assert_eq!(
+            before.active_until.unwrap().to_rfc3339(),
+            "2026-09-30T12:48:02+00:00"
+        );
+        assert_eq!(
+            before.last_checked_at.unwrap().to_rfc3339(),
+            "2026-09-23T00:19:25+00:00"
+        );
+        // A new access token alone does not pretend an old subscription date was refreshed.
+        let refreshed = tokens(
+            json!({"access_token":c.access_token,"expires_in":3600}),
+            Some(&c),
+        )
+        .unwrap();
+        assert_eq!(
+            account_details(&refreshed).unwrap().subscription,
+            Some(before.clone())
+        );
+        for date in [Value::Null, json!("invalid"), json!(2000000000)] {
+            let mut next = c.clone();
+            next.access_token = token(
+                json!({"chatgpt_account_id":"a","chatgpt_plan_type":"pro","chatgpt_subscription_active_until":date,"exp":2000000000}),
+            );
+            assert!(
+                account_details(&next)
+                    .unwrap()
+                    .subscription
+                    .unwrap()
+                    .active_until
+                    .is_none()
+            );
+        }
+        for plan in ["free", "plus", "future_plan"] {
+            let mut next = c.clone();
+            next.access_token = token(json!({"chatgpt_account_id":"a","chatgpt_plan_type":plan}));
+            assert!(account_details(&next).unwrap().subscription.is_none());
+        }
+        let mut wrong = c.clone();
+        wrong.access_token = token(
+            json!({"chatgpt_account_id":"b","chatgpt_plan_type":"pro","chatgpt_subscription_active_until":"2030-01-01T00:00:00Z"}),
+        );
+        assert_eq!(account_details(&wrong).unwrap().subscription, Some(before));
+        let fresh=tokens(json!({"access_token":c.access_token,"id_token":token(json!({"chatgpt_account_id":"a","chatgpt_plan_type":"pro","chatgpt_subscription_active_until":"2030-01-01T00:00:00Z","chatgpt_subscription_last_checked":"2026-10-16T00:00:00Z"}))}),Some(&c)).unwrap();
+        assert_eq!(
+            account_details(&fresh)
+                .unwrap()
+                .subscription
+                .unwrap()
+                .active_until
+                .unwrap()
+                .to_rfc3339(),
+            "2030-01-01T00:00:00+00:00"
+        );
     }
 
     #[test]

@@ -266,6 +266,54 @@ impl AccountStore for PgStore {
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(a)
     }
+    async fn subscription(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<xxgate_core::accounts::SubscriptionSnapshot>> {
+        sqlx::query("SELECT s.data FROM account_subscriptions s JOIN accounts a ON a.id=s.account_id WHERE a.id=$1 AND a.deleted_at IS NULL AND s.data->>'upstream_account_id'=a.data->>'upstream_account_id'")
+            .bind(id).fetch_optional(&self.pool).await.map_err(|_| Error::storage())?
+            .as_ref().map(decode).transpose()
+    }
+    async fn save_subscription(
+        &self,
+        expected: &Account,
+        snapshot: &xxgate_core::accounts::SubscriptionSnapshot,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
+        let row =
+            sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
+                .bind(expected.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| Error::storage())?
+                .ok_or_else(Error::not_found)?;
+        let current: Account = decode(&row)?;
+        if current.version != expected.version
+            || current.credential_version != expected.credential_version
+            || current.upstream_account_id != snapshot.upstream_account_id
+        {
+            return Err(Error::new(
+                409,
+                "subscription_account_changed",
+                "账户或授权已变更，请重新查询套餐信息",
+            ));
+        }
+        sqlx::query("INSERT INTO account_subscriptions(account_id,checked_at,data) VALUES($1,$2,$3) ON CONFLICT(account_id) DO UPDATE SET checked_at=EXCLUDED.checked_at,data=EXCLUDED.data WHERE account_subscriptions.checked_at<=EXCLUDED.checked_at")
+            .bind(expected.id).bind(snapshot.last_checked_at).bind(encode(snapshot)?).execute(&mut *tx).await.map_err(|_| Error::storage())?;
+        event_tx(
+            &mut tx,
+            &AuditEvent::new(
+                "subscription_refreshed",
+                "admin",
+                None,
+                Some(expected.id),
+                json!({"source":snapshot.source,"checked_at":snapshot.last_checked_at}),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(|_| Error::storage())?;
+        Ok(())
+    }
     async fn extra_credits(&self, id: Uuid) -> Result<Option<xxgate_core::quota::ExtraCredits>> {
         sqlx::query("SELECT data FROM account_extra_credits WHERE account_id=$1")
             .bind(id)

@@ -7,6 +7,7 @@ mod oauth_browser;
 mod public;
 mod public_models;
 mod resets;
+mod subscriptions;
 
 use axum::{
     Json, Router,
@@ -30,6 +31,7 @@ pub struct AppState {
     pub cleanup: Arc<RwLock<Value>>,
     pub(crate) model_sync: Arc<RwLock<catalog::SyncJob>>,
     pub(crate) oauth: Arc<Mutex<HashMap<uuid::Uuid, oauth::Flow>>>,
+    pub(crate) subscription_refresh: Arc<Mutex<()>>,
     pub(crate) login_attempts: Arc<Mutex<Vec<tokio::time::Instant>>>,
 }
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             model_sync: Default::default(),
             oauth: Default::default(),
             login_attempts: Default::default(),
+            subscription_refresh: Default::default(),
         }
     }
 }
@@ -82,6 +85,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/accounts/{id}/enabled", put(admin::enable_account))
         .route("/accounts/{id}/refresh", post(admin::refresh_account))
+        .route(
+            "/accounts/{id}/subscription/refresh",
+            post(subscriptions::refresh),
+        )
         .route("/accounts/{id}/quota", post(admin::refresh_quota))
         .route("/accounts/{id}/reset-credits", get(resets::get))
         .route(
