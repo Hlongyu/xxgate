@@ -4,7 +4,9 @@ FROM ${RUST_BUILD_IMAGE} AS builder
 ARG CARGO_BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /build
-RUN apt-get update \
+ARG SYSTEM_PACKAGES_REFRESH=0
+RUN : "$SYSTEM_PACKAGES_REFRESH" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates cmake pkg-config libssl-dev perl clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
@@ -16,7 +18,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/xxgate-server /usr/local/bin/xxgate-server
 
 FROM ${RUNTIME_IMAGE} AS runtime
-RUN apt-get update \
+ARG SYSTEM_PACKAGES_REFRESH=0
+RUN : "$SYSTEM_PACKAGES_REFRESH" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 xxgate \

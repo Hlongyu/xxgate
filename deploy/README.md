@@ -33,7 +33,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 node --test crates/xxgate-server/web/tests/*.test.cjs
 
-docker buildx build --pull --no-cache --platform linux/amd64 --load \
+docker buildx build --pull --platform linux/amd64 --load \
+  --build-arg SYSTEM_PACKAGES_REFRESH="$(date -u +%Y%m%dT%H%M%SZ)" \
   -t local/xxgate:<tag> .
 docker run --rm -i --platform linux/amd64 --read-only --entrypoint sh \
   local/xxgate:<tag> -s < scripts/check-release-certificates.sh
@@ -41,7 +42,7 @@ docker save local/xxgate:<tag> | gzip > xxgate-image.tar.gz
 shasum -a 256 xxgate-image.tar.gz > xxgate-image.tar.gz.sha256
 ```
 
-将 `<tag>` 替换为本次发布的唯一标记。发布构建刷新基础镜像并重新安装系统软件包，避免复用过期的证书层。证书包检查必须通过后才能导出镜像；检查失败时停止发布。先在开发机用隔离配置验证镜像启动、管理接口和静态资源，再传输成品镜像、校验文件及部署配置。生产主机只执行 SHA-256 校验、`docker load`、候选检查、备份和 `up --no-build`。
+将 `<tag>` 替换为本次发布的唯一标记。发布构建用 `--pull` 刷新基础镜像，并为 `SYSTEM_PACKAGES_REFRESH` 传入本次唯一值以重新安装系统软件包，避免复用过期的证书层。不要使用全局 `--no-cache`：它会清除这些 RUN 步骤的 BuildKit 缓存挂载，使 Cargo registry、git 和 target 无法复用。系统包层刷新会重跑 Cargo，但保留同一 builder 的依赖与编译产物缓存；工具链或依赖变更仍可能导致必要的重编译。不要在发布构建期间启动不同资源配置的 Apple container 构建，它可能重启共享 builder。证书包检查必须通过后才能导出镜像；检查失败时停止发布。先在开发机用隔离配置验证镜像启动、管理接口和静态资源，再传输成品镜像、校验文件及部署配置。生产主机只执行 SHA-256 校验、`docker load`、候选检查、备份和 `up --no-build`。
 
 多阶段 Dockerfile 使用 Cargo.lock、Rust 1.96.0 和 Debian Bookworm；最终镜像只包含服务程序与运行依赖。程序以 UID/GID 10001 运行，根文件系统只读。构建参数 `RUST_BUILD_IMAGE` 和 `RUNTIME_IMAGE` 可指定对应基础镜像缓存。
 
@@ -55,7 +56,9 @@ XXGate 的 native-tls 和部分客户端使用系统证书库；订阅查询的 
 
 ```sh
 container build --platform linux/amd64 --cpus 4 --memory 6G \
-  --pull --no-cache --progress plain -t local/xxgate:<tag> .
+  --pull --progress plain \
+  --build-arg SYSTEM_PACKAGES_REFRESH="$(date -u +%Y%m%dT%H%M%SZ)" \
+  -t local/xxgate:<tag> .
 container run --rm -i --platform linux/amd64 --read-only --entrypoint sh \
   local/xxgate:<tag> -s < scripts/check-release-certificates.sh
 container image save --platform linux/amd64 \
