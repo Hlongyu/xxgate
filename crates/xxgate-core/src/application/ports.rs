@@ -115,7 +115,7 @@ pub trait GroupStore: Send + Sync {
 
 #[async_trait]
 pub trait RequestStore: Send + Sync {
-    async fn safety_rejection(&self, session: &SessionKey) -> Result<Option<crate::Error>>;
+    async fn safety_rejection(&self, session: &SessionKey) -> Result<Option<(u32, crate::Error)>>;
     async fn save_safety_rejection(&self, session: &SessionKey, error: &crate::Error)
     -> Result<()>;
     async fn begin_request(&self, record: &RequestRecord) -> Result<()>;

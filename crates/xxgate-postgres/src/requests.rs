@@ -18,23 +18,25 @@ impl RequestStore for PgStore {
     async fn safety_rejection(
         &self,
         session: &xxgate_core::identity::SessionKey,
-    ) -> Result<Option<Error>> {
-        sqlx::query("SELECT data FROM safety_rejections WHERE key_id=$1 AND session_id=$2")
-            .bind(session.key_id)
-            .bind(&session.client_session_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| Error::storage())?
-            .as_ref()
-            .map(decode)
-            .transpose()
+    ) -> Result<Option<(u32, Error)>> {
+        sqlx::query(
+            "SELECT data,rejection_count FROM safety_rejections WHERE key_id=$1 AND session_id=$2",
+        )
+        .bind(session.key_id)
+        .bind(&session.client_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| Error::storage())?
+        .as_ref()
+        .map(|row| Ok((row.get::<i32, _>("rejection_count") as u32, decode(row)?)))
+        .transpose()
     }
     async fn save_safety_rejection(
         &self,
         session: &xxgate_core::identity::SessionKey,
         error: &Error,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO safety_rejections(key_id,session_id,data) VALUES($1,$2,$3) ON CONFLICT(key_id,session_id) DO NOTHING")
+        sqlx::query("INSERT INTO safety_rejections(key_id,session_id,data) VALUES($1,$2,$3) ON CONFLICT(key_id,session_id) DO UPDATE SET rejection_count=LEAST(3,safety_rejections.rejection_count+1)")
             .bind(session.key_id).bind(&session.client_session_id).bind(encode(error)?)
             .execute(&self.pool).await.map_err(|_| Error::storage())?;
         Ok(())
@@ -547,5 +549,135 @@ mod cache_tests {
             .await
             .unwrap();
         store.pool.close().await;
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+    use xxgate_core::identity::SessionKey;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn safety_counts_backfill_real_rejections_and_increment_atomically() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let schema = format!("safety_test_{}", Uuid::new_v4().simple());
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let path = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',$1,false)")
+                        .bind(path)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0015_safety_rejections.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE requests(key_id UUID,client_session_id TEXT,data JSONB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let key = Uuid::new_v4();
+        let error = Error::new(
+            403,
+            "upstream_content_policy_violation",
+            "classified safety rejection",
+        );
+        for count in [0, 1, 2, 4] {
+            let session = format!("legacy-{count}");
+            sqlx::query("INSERT INTO safety_rejections(key_id,session_id,data) VALUES($1,$2,$3)")
+                .bind(key)
+                .bind(&session)
+                .bind(encode(&error).unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+            for i in 0..count + 3 {
+                let code = if i < count {
+                    "upstream_content_policy_violation"
+                } else {
+                    "session_safety_blocked"
+                };
+                sqlx::query("INSERT INTO requests VALUES($1,$2,$3)")
+                    .bind(key)
+                    .bind(&session)
+                    .bind(json!({"error_code":code}))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::raw_sql(include_str!(
+            "../migrations/0020_safety_rejection_counts.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = PgStore { pool };
+        for count in [0, 1, 2, 4] {
+            let session = SessionKey {
+                key_id: key,
+                client_session_id: format!("legacy-{count}"),
+            };
+            assert_eq!(
+                store.safety_rejection(&session).await.unwrap().unwrap().0,
+                count.clamp(1, 3)
+            );
+        }
+        let session = SessionKey {
+            key_id: key,
+            client_session_id: "parallel".into(),
+        };
+        let (a, b, c) = tokio::join!(
+            store.save_safety_rejection(&session, &error),
+            store.save_safety_rejection(&session, &error),
+            store.save_safety_rejection(&session, &error),
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        assert_eq!(
+            store.safety_rejection(&session).await.unwrap().unwrap().0,
+            3
+        );
+        store.save_safety_rejection(&session, &error).await.unwrap();
+        assert_eq!(
+            store.safety_rejection(&session).await.unwrap().unwrap().0,
+            3
+        );
+        let other_key = SessionKey {
+            key_id: Uuid::new_v4(),
+            ..session.clone()
+        };
+        assert!(store.safety_rejection(&other_key).await.unwrap().is_none());
+        sqlx::query("DELETE FROM requests")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.safety_rejection(&session).await.unwrap().unwrap().0,
+            3
+        );
+        sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        store.pool.close().await;
+        admin.close().await;
     }
 }

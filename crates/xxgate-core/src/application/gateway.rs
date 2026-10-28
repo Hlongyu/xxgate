@@ -165,10 +165,10 @@ impl Gateway {
         });
         if let Some(session) = &safety_session {
             self.safety.check(session)?;
-            if let Some(error) = self.store.safety_rejection(session).await? {
-                self.safety.remember(session.clone(), error.clone());
-                return Err(super::safety::blocked(error));
+            if let Some((count, error)) = self.store.safety_rejection(session).await? {
+                self.safety.restore(session.clone(), count, error);
             }
+            self.safety.check(session)?;
         }
         let since = Instant::now();
         let ticket = self.scheduler.enqueue(
@@ -307,7 +307,10 @@ impl Gateway {
     }
 
     fn observe_safety_rejection(&self, e: &mut Execution, error: &Error) {
-        if error.code == "upstream_content_policy_violation" && !e.record.stateless {
+        if error.code == "upstream_content_policy_violation"
+            && !e.record.stateless
+            && e.safety_rejection.is_none()
+        {
             self.safety.remember(
                 SessionKey {
                     key_id: e.record.key_id,

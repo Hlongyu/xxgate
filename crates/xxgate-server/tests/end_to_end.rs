@@ -677,6 +677,8 @@ async fn real_http_postgres_gateway_contract() {
     let (base, server_task) = serve(router(AppState::new(gateway.clone(), true, false))).await;
     let mut c = Client {
         http: reqwest::Client::builder()
+            // Early rejection tests can close connections with unread request bodies.
+            .pool_max_idle_per_host(0)
             .cookie_store(true)
             .timeout(Duration::from_secs(10))
             .build()

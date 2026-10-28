@@ -37,13 +37,14 @@ pub(super) fn upstream(behavior: &str) -> Option<Response> {
                 .into_response(),
         );
     }
-    Some(
-        (
-            [("content-type", "text/event-stream")],
-            Body::from(frame(event)),
-        )
-            .into_response(),
-    )
+    let body = if behavior == "policy-duplicate" {
+        let mut repeated = frame(event.clone()).to_vec();
+        repeated.extend_from_slice(&frame(event));
+        Bytes::from(repeated)
+    } else {
+        frame(event)
+    };
+    Some(([("content-type", "text/event-stream")], Body::from(body)).into_response())
 }
 
 pub(super) async fn verify(c: &Client, mock: &Mock) {
@@ -107,6 +108,44 @@ pub(super) async fn verify_sessions(c: &Client, gateway: &Arc<Gateway>, mock: &M
     // This session was rejected by the HTTP classification test above.
     let session = "policy-http-false";
     c.admin("/models", "PUT", Some(json!({"id":"safety-test-alias","upstream":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"enabled":true,"capabilities":{},"version":0}))).await;
+    // One rejection must not block a sibling; success does not reset the count.
+    let response = c.response(session, "normal", false, "default").await;
+    assert_eq!(response.status(), 200);
+    response.bytes().await.unwrap();
+    let response = c.response(session, "policy-http", false, "default").await;
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "upstream_content_policy_violation"
+    );
+
+    // Restart below the threshold: two persisted rejections still allow requests.
+    let partial = Gateway::new(
+        gateway.store.clone(),
+        gateway.cipher.clone(),
+        Arc::new(ResponsesIngress),
+        Arc::new(CodexProvider),
+        |s| Arc::new(HttpTransport::new(s, true)),
+    )
+    .await
+    .unwrap();
+    let (base, partial_task) = serve(router(AppState::new(partial.clone(), true, false))).await;
+    for behavior in ["normal", "policy-http"] {
+        let response = c.http.post(format!("{base}/v1/responses")).bearer_auth(&c.key)
+            .header("session-id", session).header("thread-id", "after-partial-restart")
+            .json(&json!({"model":"mock-model","instructions":behavior,"input":"different content","stream":false}))
+            .send().await.unwrap();
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap();
+        if behavior == "normal" {
+            assert_eq!(status, 200);
+        } else {
+            assert_eq!(body["error"]["code"], "upstream_content_policy_violation");
+        }
+    }
+    partial.shutdown.cancel();
+    partial.tasks.close();
+    partial.tasks.wait().await;
+    partial_task.abort();
     let before = mock.calls.load(Ordering::SeqCst);
     for model in ["mock-model", "safety-test-alias"] {
         let response = c.http.post(format!("{}/v1/responses",c.base)).bearer_auth(&c.key)
@@ -219,6 +258,16 @@ pub(super) async fn verify_sessions(c: &Client, gateway: &Arc<Gateway>, mock: &M
     let mut cfg = original.clone();
     cfg["session_max_inflight"] = json!(1);
     c.admin("/settings", "PUT", Some(cfg)).await;
+    // The held rejection is the third; queued siblings must stop at that point.
+    for _ in 0..2 {
+        let response = c
+            .response("policy-queued-session", "policy-http", false, "default")
+            .await;
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "upstream_content_policy_violation"
+        );
+    }
     let before = mock.calls.load(Ordering::SeqCst);
     let held = c
         .response("policy-queued-session", "policy-held", true, "default")
@@ -263,6 +312,37 @@ pub(super) async fn verify_sessions(c: &Client, gateway: &Arc<Gateway>, mock: &M
     let mut cfg = c.admin("/settings", "GET", None).await;
     cfg["session_max_inflight"] = original["session_max_inflight"].clone();
     c.admin("/settings", "PUT", Some(cfg)).await;
+
+    // Repeated failure events within one upstream request count only once.
+    let response = c
+        .response(
+            "policy-duplicate-session",
+            "policy-duplicate",
+            false,
+            "default",
+        )
+        .await;
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "upstream_content_policy_violation"
+    );
+    // A second request is still permitted, and the third real rejection blocks.
+    for _ in 0..2 {
+        let response = c
+            .response("policy-duplicate-session", "policy-http", false, "default")
+            .await;
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "upstream_content_policy_violation"
+        );
+    }
+    let response = c
+        .response("policy-duplicate-session", "normal", false, "default")
+        .await;
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "session_safety_blocked"
+    );
 
     // A non-policy upstream error does not block the session's next request.
     let response = c

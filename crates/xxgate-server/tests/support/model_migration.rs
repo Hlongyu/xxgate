@@ -119,9 +119,14 @@ pub(super) async fn verify(c: &Client, gateway: &Gateway, mock: &Mock, a: &str, 
         new["request"]["binding_id"]
     );
     // Migration must never bypass a subsequent per-session safety decision.
-    let rejected = request(c, "policy", "migration-target", "policy-http", false).await;
-    assert_eq!(rejected.status(), 403);
-    rejected.bytes().await.unwrap();
+    for _ in 0..3 {
+        let rejected = request(c, "policy", "migration-target", "policy-http", false).await;
+        assert_eq!(rejected.status(), 403);
+        assert_eq!(
+            rejected.json::<Value>().await.unwrap()["error"]["code"],
+            "upstream_content_policy_violation"
+        );
+    }
     let calls = mock.calls.load(Ordering::SeqCst);
     configure(c, b, json!(["only-b"]), true, 10).await;
     let blocked = request(c, "a", "mock-model", "normal", false).await;
