@@ -85,6 +85,10 @@ impl AccessStore for PgStore {
         .await?;
         tx.commit().await.map_err(|_| Error::storage())
     }
+    async fn key_by_id(&self, id: Uuid) -> Result<Option<GatewayKey>> {
+        sqlx::query("SELECT id,group_id,name,prefix,enabled,created_at,last_used_at FROM api_keys WHERE id=$1 AND deleted_at IS NULL")
+            .bind(id).fetch_optional(&self.pool).await.map_err(|_| Error::storage())?.as_ref().map(key).transpose()
+    }
     async fn keys(&self) -> Result<Vec<GatewayKey>> {
         sqlx::query("SELECT id,group_id,name,prefix,enabled,created_at,last_used_at FROM api_keys WHERE deleted_at IS NULL ORDER BY created_at DESC").fetch_all(&self.pool).await.map_err(|_| Error::storage())?.iter().map(key).collect()
     }

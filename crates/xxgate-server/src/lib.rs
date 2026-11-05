@@ -4,3 +4,7 @@ pub mod workers;
 
 mod logging;
 mod model_version;
+
+mod telemetry;
+
+pub mod cluster;

@@ -32,6 +32,7 @@ values = json.loads(config.read_text())
 for key, value in values.items():
     environment.setdefault(key, value)
 subprocess.run(["docker", "compose", "-p", "xxgate", "up", "-d", "--wait"], check=True)
+subprocess.run(["cargo", "run", "-p", "xxgate-server", "--", "migrate"], env=environment, check=True)
 print(f"Local administrator credentials: {config}", flush=True)
 print(f"Open http://{environment['XXGATE_BIND']}", flush=True)
 os.execvpe("cargo", ["cargo", "run", "-p", "xxgate-server"], environment)

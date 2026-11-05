@@ -60,6 +60,8 @@ pub struct ProtocolDocument {
 }
 
 pub struct GatewayRequest {
+    /// Server-generated ID for a native downstream WebSocket, never a client header.
+    pub websocket_session: Option<Uuid>,
     /// Observed for diagnostics only; not part of outbound identity headers.
     pub client_turn_state: crate::turn_state::TurnStateHeader,
     pub client_origin: crate::clients::ClientOrigin,
@@ -112,6 +114,16 @@ pub enum EncryptedContentError {
 }
 
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
+/// Authenticated scheduling scope, never derived from an unscoped client ID.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ResponseConnectionKey {
+    pub websocket_session: Option<Uuid>,
+    /// Stateless HTTP requests use a fresh socket and do not retain it.
+    pub reusable: bool,
+    pub thread: crate::identity::ThreadKey,
+    pub binding_id: Uuid,
+}
 
 pub struct UpstreamResponse {
     pub status: u16,
@@ -231,6 +243,18 @@ pub trait ProviderAdapter: Send + Sync {
 
 #[async_trait]
 pub trait UpstreamTransport: Send + Sync {
+    fn close_response_session(&self, _session: Uuid) {}
+
+    /// Responses may reuse a connection; other operations retain HTTP semantics.
+    async fn send_response(
+        &self,
+        request: PreparedRequest,
+        _connection: Option<ResponseConnectionKey>,
+        cancel: CancellationToken,
+    ) -> Result<UpstreamResponse> {
+        self.send_once(request, cancel).await
+    }
+
     async fn send_once(
         &self,
         request: PreparedRequest,

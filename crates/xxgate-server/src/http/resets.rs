@@ -10,10 +10,14 @@ use uuid::Uuid;
 use xxgate_core::Error;
 
 pub(super) async fn view(s: &AppState, id: Uuid) -> xxgate_core::Result<Value> {
-    s.gateway
-        .scheduler
-        .account(id)
-        .ok_or_else(Error::not_found)?;
+    if let Some(cluster) = s.cluster.as_ref().filter(|c| c.router) {
+        cluster.store.account_node(id).await?;
+    } else {
+        s.gateway
+            .scheduler
+            .account(id)
+            .ok_or_else(Error::not_found)?;
+    }
     let snapshot = s.gateway.store.reset_credits(id).await?;
     let now = Utc::now();
     Ok(json!({

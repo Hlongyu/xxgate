@@ -29,6 +29,17 @@ pub async fn dashboard(
 ) -> ApiResult<Json<Value>> {
     let mut result = s.gateway.store.dashboard(&q).await?;
     result["runtime"] = json!({"queue":s.gateway.scheduler.stats(),"memory_bytes":s.gateway.memory.used(),"memory_admission":s.gateway.memory_admission.status(),"config_version":s.gateway.settings.current().version});
+    if let Some(cluster) = s.cluster.as_ref().filter(|c| c.router) {
+        let nodes = cluster.store.nodes().await?;
+        let mut inflight = 0u64;
+        let mut queued = 0u64;
+        for node in nodes.iter().filter(|n| n.online && n.role == "worker") {
+            inflight += node.runtime["queue"]["inflight"].as_u64().unwrap_or(0);
+            queued += node.runtime["queue"]["queued"].as_u64().unwrap_or(0);
+        }
+        result["runtime"]["queue"] = json!({"inflight":inflight,"queued":queued,"paused":!nodes.iter().any(|n|n.online&&n.accepting)});
+        result["runtime"]["nodes"] = json!(nodes);
+    }
     Ok(Json(result))
 }
 // Read identity metadata without refreshing tokens or making upstream requests.
@@ -92,7 +103,7 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let mut items = Vec::new();
     let now = Utc::now();
     let stale = s.gateway.settings.current().quota_stale_after_secs;
-    for account in s.gateway.store.accounts().await? {
+    for account in s.visible_accounts().await? {
         let windows = s
             .gateway
             .store
@@ -113,25 +124,39 @@ pub async fn accounts(State(s): State<AppState>) -> ApiResult<Json<Value>> {
         let resets = super::resets::view(&s, account.id).await?;
         let identity = account_identity(&s, account.id).await?;
         let (plan, subscription) = subscription_metadata(&s, account.id, &identity).await?;
-        items.push(json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":account,"quotas":windows,"extra_credits":extra_credits_view(&s, account.id).await?,"spending":spending,"resets":resets}));
+        items.push(json!({"node_id":s.account_node(account.id).await?,"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":account,"quotas":windows,"extra_credits":extra_credits_view(&s, account.id).await?,"spending":spending,"resets":resets}));
     }
-    Ok(Json(
-        json!({"items":items,"runtime":s.gateway.scheduler.stats()}),
-    ))
+    let mut runtime = json!(s.gateway.scheduler.stats());
+    if let Some(c) = s.cluster.as_ref().filter(|c| c.router) {
+        let nodes = c.store.nodes().await?;
+        runtime["accounts"] = json!(
+            nodes
+                .iter()
+                .filter(|n| n.online && n.role == "worker")
+                .flat_map(|n| n.runtime["queue"]["accounts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .cloned())
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(Json(json!({"items":items,"runtime":runtime})))
 }
 pub async fn account_detail(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let a = s
-        .gateway
-        .scheduler
-        .account(id)
+        .visible_accounts()
+        .await?
+        .into_iter()
+        .find(|a| a.id == id)
         .ok_or_else(Error::not_found)?;
     let identity = account_identity(&s, id).await?;
     let (plan, subscription) = subscription_metadata(&s, id, &identity).await?;
     Ok(Json(
-        json!({"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":a,"quotas":s.gateway.store.quotas(id).await?,"extra_credits":extra_credits_view(&s,id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
+        json!({"node_id":s.account_node(id).await?,"email":identity.as_ref().and_then(|d|d.email.as_ref()),"plan_type":plan,"subscription":subscription,"account":a,"quotas":s.gateway.store.quotas(id).await?,"extra_credits":extra_credits_view(&s,id).await?,"statistics":s.gateway.store.dashboard(&UsageFilter{account_id:Some(id),..Default::default()}).await?,"spending":s.gateway.store.account_spending(id,Utc::now(),s.gateway.settings.current().quota_stale_after_secs).await?}),
     ))
 }
 #[derive(Deserialize)]
@@ -139,6 +164,8 @@ pub async fn account_detail(
 pub struct CreateAccount {
     #[serde(default)]
     codex_only: bool,
+    #[serde(default)]
+    responses_websocket_enabled: bool,
     #[serde(default)]
     use_extra_credits: bool,
     name: String,
@@ -169,6 +196,7 @@ pub async fn create_account(
         access_kind: "codex_oauth".into(),
         enabled: false,
         codex_only: input.codex_only,
+        responses_websocket_enabled: input.responses_websocket_enabled,
         use_extra_credits: input.use_extra_credits,
         disable_reason: Some(DisableReason::AdminDisabled),
         max_inflight: input
@@ -218,6 +246,7 @@ pub async fn create_account(
 #[serde(deny_unknown_fields)]
 pub struct AccountUpdate {
     codex_only: Option<bool>,
+    responses_websocket_enabled: Option<bool>,
     use_extra_credits: Option<bool>,
     version: i64,
     group_ids: Option<Vec<Uuid>>,
@@ -245,6 +274,9 @@ pub async fn update_account(
     }
     if let Some(codex_only) = input.codex_only {
         a.codex_only = codex_only;
+    }
+    if let Some(enabled) = input.responses_websocket_enabled {
+        a.responses_websocket_enabled = enabled;
     }
     let credit_policy_changed = input
         .use_extra_credits
@@ -591,4 +623,12 @@ pub async fn metrics(State(s): State<AppState>) -> String {
         output.push_str(&format!("xxgate_memory_used_bytes{{domain=\"{}\"}} {}\nxxgate_memory_limit_bytes{{domain=\"{}\"}} {}\n", index, domain.used_bytes, index, domain.limit_bytes));
     }
     output
+}
+
+#[derive(Deserialize)]
+pub struct TelemetryQuery {
+    since: Option<i64>,
+}
+pub async fn telemetry(State(s): State<AppState>, Query(q): Query<TelemetryQuery>) -> Json<Value> {
+    Json(s.telemetry.snapshot(q.since))
 }

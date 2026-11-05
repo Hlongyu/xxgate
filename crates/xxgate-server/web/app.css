@@ -247,6 +247,7 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
 .requests-page .trace-request-id,.requests-page .trace-session-link{display:inline-flex;padding:2px 0!important}
 .requests-page .trace-session-link{margin-left:8px}
 .requests-page .trace-source-line{gap:4px;margin-bottom:4px}
+.request-transport{display:inline-flex;align-items:center;padding:4px 6px;border-radius:7px;font-size:10px;line-height:1.2;white-space:nowrap;background:#edf1f5;color:#53667a}.request-transport.transport-websocket{background:#e6f3ef;color:#26745c}.request-transport.transport-unknown{background:#f2f4f1;color:#879187}
 .requests-page .request-type,.requests-page .client-source{padding:2px 5px;border-radius:4px}
 .requests-page .request-model .name{margin-bottom:2px}
 .requests-page .cache-cell{min-width:125px;max-width:175px}
@@ -274,3 +275,5 @@ input,select,textarea{border:1px solid #dbe3da;background:#fff;border-radius:5px
  .requests-page .request-performance{min-width:0}
  .requests-page .request-panel .cache-cell{min-width:0;max-width:none}
 }
+
+.telemetry-content{padding:22px}.telemetry-charts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px}.telemetry-charts article{min-width:0}.telemetry-title{display:flex;align-items:center;justify-content:space-between;gap:12px}.telemetry-title h3{font-size:13px;font-weight:500}.telemetry-title strong{font-size:25px;font-weight:550;font-variant-numeric:tabular-nums}.telemetry-title small{font-size:11px;font-weight:400;color:var(--muted);margin-left:5px}.telemetry-charts p{font-size:10px;color:var(--muted);min-height:30px;margin:9px 0 4px;line-height:1.6}.telemetry-chart{height:130px}.telemetry-chart svg{width:100%;height:100%;overflow:visible}.telemetry-grid{stroke:#e6ece6;stroke-width:1;fill:none}.telemetry-axis{display:flex;justify-content:space-between;color:#87938a;font-size:9px;margin-top:8px}.telemetry-detail{display:flex;gap:12px 24px;flex-wrap:wrap;padding-top:20px;margin-top:20px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}.telemetry-detail b{color:#334b3d;font-weight:500;font-variant-numeric:tabular-nums}.telemetry-note{font-size:10px;color:var(--muted);margin-top:13px;line-height:1.7}.telemetry-live{font-size:10px;color:#278052}.telemetry-stale{font-size:10px;color:#a47427}.telemetry-legend{display:inline-block;width:10px;height:3px;vertical-align:middle;margin-right:4px}.telemetry-legend.inflight{background:#278052}.telemetry-legend.queued{background:#b78535;margin-left:12px}@media(max-width:1000px){.telemetry-charts{grid-template-columns:1fr;gap:25px}.telemetry-chart{height:145px}.telemetry-title strong{font-size:23px}.telemetry-panel .panel-head{align-items:flex-start;gap:15px}}

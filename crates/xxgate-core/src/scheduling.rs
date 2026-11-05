@@ -42,6 +42,7 @@ struct State {
     leases: HashMap<Uuid, u8>,
     served: HashMap<Uuid, u64>,
     paused: bool,
+    coordination_paused: bool,
 }
 #[derive(Default)]
 struct SessionActivity {
@@ -49,8 +50,24 @@ struct SessionActivity {
     // A new binding must be persisted before another thread can use it.
     binding_pending: Option<Uuid>,
 }
+/// Transport requirement is separate from client-origin detection.
+#[derive(Clone, Copy)]
+pub struct DispatchPolicy {
+    pub source: ClientSource,
+    pub require_websocket: bool,
+}
+impl From<ClientSource> for DispatchPolicy {
+    fn from(source: ClientSource) -> Self {
+        Self {
+            source,
+            require_websocket: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Waiter {
+    require_websocket: bool,
     source: ClientSource,
     id: Uuid,
     thread_id: String,
@@ -92,6 +109,7 @@ impl State {
         group_id: Uuid,
         model: &ModelRef,
         source: ClientSource,
+        require_websocket: bool,
     ) -> Result<()> {
         self.check_key(session.key_id, group_id)?;
         if let Some(binding) = self.bindings.get(session) {
@@ -105,6 +123,7 @@ impl State {
             if let Some(a) = self.accounts.get(&binding.account_id).filter(|a| {
                 a.enabled
                     && a.group_ids.contains(&group_id)
+                    && (!require_websocket || a.responses_websocket_enabled)
                     && a.accepts(source)
                     && a.supports(model)
             }) && !self.blocked.contains(&a.id)
@@ -117,6 +136,7 @@ impl State {
                 && !self.blocked.contains(&a.id)
                 && a.group_ids.contains(&group_id)
                 && a.supports(model)
+                && (!require_websocket || a.responses_websocket_enabled)
         };
         if !self
             .accounts
@@ -141,7 +161,7 @@ impl State {
     }
 
     fn check_key(&self, id: Uuid, group_id: Uuid) -> Result<()> {
-        if self.paused {
+        if self.paused || self.coordination_paused {
             return Err(Error::storage());
         }
         if self.blocked_keys.contains(&id) {
@@ -230,6 +250,14 @@ impl Scheduler {
         drop(s);
         self.wake();
     }
+    /// Replace shared Key policy while preserving local account/queue state.
+    pub fn replace_keys(&self, keys: Vec<GatewayKey>) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.keys = keys.into_iter().map(|k| (k.id, k)).collect();
+        s.blocked_keys.clear();
+        drop(s);
+        self.wake();
+    }
     pub fn remove_account(&self, id: Uuid) {
         let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         s.deleted_accounts.insert(id);
@@ -262,6 +290,15 @@ impl Scheduler {
             .insert(id);
         self.wake();
     }
+    /// Transient coordinator failures must never clear a persistence failure.
+    pub fn set_coordination_paused(&self, value: bool) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coordination_paused = value;
+        self.wake();
+    }
     pub fn set_paused(&self, value: bool) {
         self.0
             .state
@@ -291,16 +328,20 @@ impl Scheduler {
         thread: ThreadKey,
         group_id: Uuid,
         model: ModelRef,
-        source: ClientSource,
+        policy: impl Into<DispatchPolicy>,
         since: Instant,
     ) -> Result<QueueTicket> {
+        let DispatchPolicy {
+            source,
+            require_websocket,
+        } = policy.into();
         let session = thread.session;
         let settings = self.0.settings.current();
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.paused {
+        if state.paused || state.coordination_paused {
             return Err(Error::storage());
         }
-        state.check_eligibility(&session, group_id, &model, source)?;
+        state.check_eligibility(&session, group_id, &model, source, require_websocket)?;
         if state.queues.values().map(VecDeque::len).sum::<usize>() >= settings.queue_capacity {
             return Err(Error::new(
                 429,
@@ -316,6 +357,7 @@ impl Scheduler {
             .entry(session.clone())
             .or_default()
             .push_back(Waiter {
+                require_websocket,
                 source,
                 id,
                 thread_id: thread.client_thread_id,
@@ -335,7 +377,7 @@ impl Scheduler {
     fn try_reserve(&self, id: Uuid) -> Result<Option<DispatchLease>> {
         let cfg = self.0.settings.current();
         let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.paused {
+        if s.paused || s.coordination_paused {
             return Err(Error::storage());
         }
         let (session, waiter) = s
@@ -343,7 +385,13 @@ impl Scheduler {
             .iter()
             .find_map(|(session, queue)| queue.iter().find(|w| w.id == id).map(|w| (session, w)))
             .ok_or_else(Error::not_found)?;
-        s.check_eligibility(session, waiter.group_id, &waiter.model, waiter.source)?;
+        s.check_eligibility(
+            session,
+            waiter.group_id,
+            &waiter.model,
+            waiter.source,
+            waiter.require_websocket,
+        )?;
         if s.inflight.values().sum::<u32>() >= cfg.global_max_inflight {
             return Ok(None);
         }
@@ -369,6 +417,7 @@ impl Scheduler {
                             waiter.group_id,
                             &waiter.model,
                             waiter.source,
+                            waiter.require_websocket,
                         )
                         .is_err()
                         || waiter.since.elapsed() >= Duration::from_millis(cfg.queue_timeout_ms)
@@ -384,6 +433,7 @@ impl Scheduler {
                         .filter(|a| {
                             a.enabled
                                 && a.group_ids.contains(&waiter.group_id)
+                                && (!waiter.require_websocket || a.responses_websocket_enabled)
                                 && a.accepts(waiter.source)
                                 && a.supports(&waiter.model)
                         });
@@ -397,6 +447,7 @@ impl Scheduler {
                                     && a.group_ids.contains(&waiter.group_id)
                                     && !s.blocked.contains(&a.id)
                                     && a.supports(&waiter.model)
+                                    && (!waiter.require_websocket || a.responses_websocket_enabled)
                                     && a.accepts(waiter.source)
                                     && s.inflight.get(&a.id).copied().unwrap_or(0) < a.max_inflight
                             })
@@ -464,6 +515,7 @@ impl Scheduler {
         drop(s);
         self.wake();
         Ok(Some(DispatchLease {
+            require_websocket: waiter.require_websocket,
             source: waiter.source,
             scheduler: self.clone(),
             id,
@@ -527,7 +579,7 @@ impl Scheduler {
         QueueStats {
             queued: requests.len(),
             inflight: s.inflight.values().sum(),
-            paused: s.paused,
+            paused: s.paused || s.coordination_paused,
             accounts,
             requests,
         }
@@ -579,6 +631,7 @@ impl Drop for QueueTicket {
 }
 
 pub struct DispatchLease {
+    require_websocket: bool,
     source: ClientSource,
     model: ModelRef,
     group_id: Uuid,
@@ -647,7 +700,7 @@ impl DispatchLease {
             .state
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if s.paused {
+        if s.paused || s.coordination_paused {
             return Err(Error::storage());
         }
         s.check_key(self.session.key_id, self.group_id)?;
@@ -656,6 +709,8 @@ impl DispatchLease {
                 a.enabled
                     && a.group_ids.contains(&self.group_id)
                     && a.supports(&self.model)
+                    && (!self.require_websocket || a.responses_websocket_enabled)
+                    && a.responses_websocket_enabled == self.account.responses_websocket_enabled
                     && a.accepts(self.source)
             })
         {
@@ -779,6 +834,7 @@ mod tests {
             access_kind: "codex_oauth".into(),
             enabled: true,
             codex_only: false,
+            responses_websocket_enabled: false,
             use_extra_credits: false,
             disable_reason: None,
             max_inflight: 1,
@@ -833,6 +889,67 @@ mod tests {
             ClientSource::Unknown,
             Instant::now(),
         )
+    }
+
+    #[tokio::test]
+    async fn native_ws_selects_only_ws_accounts_and_rechecks_policy_before_send() {
+        let http = account();
+        let mut ws = account();
+        ws.responses_websocket_enabled = true;
+        let k = key(DEFAULT_GROUP_ID);
+        // Even an existing HTTP account binding cannot satisfy a native WS turn.
+        let binding = Binding::new(session(&k, "native"), http.id, &ModelRef::codex("test"), 1);
+        let scheduler = Scheduler::new(
+            LiveSettings::new(RuntimeSettings::default()),
+            vec![http, ws.clone()],
+            vec![binding],
+            vec![k.clone()],
+        );
+        let ticket = scheduler
+            .enqueue(
+                Uuid::new_v4(),
+                ThreadKey {
+                    session: session(&k, "native"),
+                    client_thread_id: "t".into(),
+                },
+                k.group_id,
+                ModelRef::codex("test"),
+                DispatchPolicy {
+                    source: ClientSource::Unknown,
+                    require_websocket: true,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        let mut lease = ticket.wait(&CancellationToken::new()).await.unwrap();
+        assert_eq!(lease.account.id, ws.id);
+        lease.confirm_binding();
+        ws.responses_websocket_enabled = false;
+        scheduler.update_account(ws);
+        assert_eq!(
+            lease.begin_send().unwrap_err().code,
+            "reservation_invalidated"
+        );
+        drop(lease);
+        let error = scheduler
+            .enqueue(
+                Uuid::new_v4(),
+                ThreadKey {
+                    session: session(&k, "native"),
+                    client_thread_id: "t".into(),
+                },
+                k.group_id,
+                ModelRef::codex("test"),
+                DispatchPolicy {
+                    source: ClientSource::Unknown,
+                    require_websocket: true,
+                },
+                Instant::now(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "no_available_account");
+        assert!(enqueue(&scheduler, &k, "http").is_ok());
     }
     #[tokio::test(start_paused = true)]
     async fn session_cap_shares_one_binding_and_leaves_capacity_for_other_sessions() {

@@ -5,14 +5,15 @@ use std::{collections::HashMap, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use xxgate_core::{
     Error, Result,
-    protocol::{PreparedRequest, UpstreamResponse, UpstreamTransport},
+    protocol::{PreparedRequest, ResponseConnectionKey, UpstreamResponse, UpstreamTransport},
     settings::LiveSettings,
 };
 
 pub struct HttpTransport {
     clients: Mutex<HashMap<String, (i64, reqwest::Client)>>,
-    settings: LiveSettings,
+    pub(crate) settings: LiveSettings,
     allow_http: bool,
+    pub(crate) responses_ws: super::responses_ws::ConnectionPool,
 }
 impl HttpTransport {
     pub fn new(settings: LiveSettings, allow_http: bool) -> Self {
@@ -21,9 +22,10 @@ impl HttpTransport {
             clients: Mutex::new(HashMap::new()),
             settings,
             allow_http,
+            responses_ws: super::responses_ws::ConnectionPool::default(),
         }
     }
-    fn client(&self, request: &PreparedRequest) -> Result<reqwest::Client> {
+    pub(crate) fn client(&self, request: &PreparedRequest) -> Result<reqwest::Client> {
         let url =
             url::Url::parse(&request.url).map_err(|_| Error::invalid("Invalid upstream URL"))?;
         if url.username() != ""
@@ -69,7 +71,7 @@ impl HttpTransport {
     }
 }
 
-fn transport_error(error: reqwest::Error) -> Error {
+pub(crate) fn transport_error(error: reqwest::Error) -> Error {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(err) = source {
         if err.downcast_ref::<ConnectDeadlineExceeded>().is_some() {
@@ -88,6 +90,24 @@ fn transport_error(error: reqwest::Error) -> Error {
 
 #[async_trait]
 impl UpstreamTransport for HttpTransport {
+    fn close_response_session(&self, session: uuid::Uuid) {
+        self.responses_ws.close_session(session);
+    }
+
+    async fn send_response(
+        &self,
+        request: PreparedRequest,
+        connection: Option<ResponseConnectionKey>,
+        cancel: CancellationToken,
+    ) -> Result<UpstreamResponse> {
+        if let Some(connection) = connection {
+            self.send_websocket_response(request, connection, cancel)
+                .await
+        } else {
+            self.send_once(request, cancel).await
+        }
+    }
+
     async fn send_once(
         &self,
         request: PreparedRequest,

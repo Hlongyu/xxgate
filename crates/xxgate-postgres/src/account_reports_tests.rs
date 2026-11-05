@@ -37,7 +37,13 @@ async fn setup(migrate_rollups: bool) -> (PgStore, String) {
             sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
         }
     }
-    (PgStore { pool }, schema)
+    (
+        PgStore {
+            pool,
+            node_id: "default".into(),
+        },
+        schema,
+    )
 }
 
 async fn teardown(store: PgStore, schema: String) {
@@ -217,6 +223,16 @@ async fn account_rollups_backfill_and_increment_match_exact_windows() {
     .execute(&store.pool)
     .await
     .unwrap();
+    // Finish the remaining schema upgrades before invoking today's store API.
+    for migration in sqlx::migrate!("./migrations")
+        .iter()
+        .filter(|m| m.version > 13)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
     // Replaying a previously finalized row cannot charge the backfill twice.
     store.finish_request(&records[0]).await.unwrap();
     for r in &records[100..] {
@@ -678,6 +694,16 @@ async fn monthly_upgrade_backfills_retained_history_without_repricing_existing_l
     .execute(&store.pool)
     .await
     .unwrap();
+    // Finish the remaining schema upgrades before invoking today's store API.
+    for migration in sqlx::migrate!("./migrations")
+        .iter()
+        .filter(|m| m.version > 13)
+    {
+        sqlx::raw_sql(&migration.sql)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
     store.finish_request(&old).await.unwrap();
     let totals:(String,String,i64)=sqlx::query_as("SELECT sum(cny)::text,sum(input_tokens)::text,sum(requests)::bigint FROM account_spending_hourly WHERE account_id=$1")
         .bind(id).fetch_one(&store.pool).await.unwrap();

@@ -12,7 +12,8 @@ use xxgate_core::{
 #[async_trait]
 impl IdentityStore for PgStore {
     async fn active_bindings(&self) -> Result<Vec<Binding>> {
-        sqlx::query("SELECT b.data FROM sessions s JOIN bindings b ON b.id=s.binding_id")
+        sqlx::query("SELECT b.data FROM sessions s JOIN bindings b ON b.id=s.binding_id JOIN accounts a ON a.id=b.account_id WHERE a.node_id=$1")
+            .bind(&self.node_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| Error::storage())?
@@ -21,7 +22,25 @@ impl IdentityStore for PgStore {
             .collect()
     }
     async fn commit_binding(&self, b: &Binding, expected_generation: i64) -> Result<()> {
+        self.require_account_owner(b.account_id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
+        sqlx::query("INSERT INTO session_nodes(key_id,client_session_id,node_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING")
+            .bind(b.session.key_id).bind(&b.session.client_session_id).bind(&self.node_id).execute(&mut *tx).await.map_err(|_|Error::storage())?;
+        let owner: String = sqlx::query_scalar(
+            "SELECT node_id FROM session_nodes WHERE key_id=$1 AND client_session_id=$2",
+        )
+        .bind(b.session.key_id)
+        .bind(&b.session.client_session_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| Error::storage())?;
+        if owner != self.node_id {
+            return Err(Error::new(
+                409,
+                "session_node_mismatch",
+                "Session belongs to another node",
+            ));
+        }
         sqlx::query(
             "INSERT INTO sessions(key_id,client_session_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
         )

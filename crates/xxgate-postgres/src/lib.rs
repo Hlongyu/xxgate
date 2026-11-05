@@ -13,3 +13,7 @@ pub use accounts::PgStore;
 #[cfg(test)]
 mod current_quotas_tests;
 mod model_version;
+
+pub mod cluster;
+
+mod migrations;

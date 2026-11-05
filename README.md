@@ -77,17 +77,33 @@ curl http://127.0.0.1:8787/v1/responses \
   -d '{"model":"your-configured-model","input":"你好","stream":true}'
 ```
 
-支持 `POST /v1/responses`、`POST /responses`、`GET /v1/models` 和 `GET /models`。`stream=false` 返回最终 JSON；内部仍以 SSE 调用 Codex 上游。支持 `session-id`/`session_id`、`thread-id`/`thread_id` 和 Codex `client_metadata` 身份字段；没有明确 session 时依次使用 `conversation-id`/`conversation_id`、thread 身份；`prompt_cache_key` 仅表示缓存分区，不作为会话标识。缺少 thread 时使用 conversation 身份或沿用解析出的 session。全部稳定字段缺失时按独立请求放行（`stateless=true`），临时调度标识仅用于本次请求，不创建持久会话绑定，不按提示词、IP 或 Key 猜测会话；同一字段的别名发生冲突时返回 `identity_conflict`。
+支持 `POST /v1/responses`、`POST /responses`、`GET /v1/models` 和 `GET /models`。`stream=false` 返回最终 JSON；内部统一按事件流处理 Codex 上游响应。支持 `session-id`/`session_id`、`thread-id`/`thread_id` 和 Codex `client_metadata` 身份字段；没有明确 session 时依次使用 `conversation-id`/`conversation_id`、thread 身份；`prompt_cache_key` 仅表示缓存分区，不作为会话标识。缺少 thread 时使用 conversation 身份或沿用解析出的 session。全部稳定字段缺失时按独立请求放行（`stateless=true`），临时调度标识仅用于本次请求，不创建持久会话绑定，不按提示词、IP 或 Key 猜测会话；同一字段的别名发生冲突时返回 `identity_conflict`。
 
 入站校验发现同组无可用账户时，流式与非流式请求都直接返回 HTTP 503，错误码为 `no_available_account`。同组有可用账户但并发满载时允许限时排队，流式请求可提前返回 HTTP 200；排队心跳为 `: xxgate.queue_heartbeat request_id=…` SSE 注释（无 `data:` / `event:`），避免中间层把它计为模型首字，后续失败通过 `response.failed` 表达。排队期间失去最后一个可用账户会立即结束等待。调用方应以流内终态判断成功，不仅看 HTTP 状态。所有 Responses 请求（包括校验失败）带 `x-request-id`，可在后台定位。
 
-暂不提供 WebSocket、Chat Completions、后台生成、`previous_response_id`及账户对象引用。正文中的消息、工具调用、工具结果及响应 ID 随内容透传，避免破坏密文绑定的对象身份；仅兼容还原旧版本发给客户端的 ID 别名。会话、线程和父子关系等客户端元数据继续成组映射。客户端携带的加密 reasoning、compaction、工具参数和内部内容元数据原样透传，包括首次接入、重启续接及跨账户迁移；网关不解密、不计算或保存内容摘要，也不按本地历史记录拦截密文，有效性由上游处理。升级会清理旧版本保存的密文摘要。
+支持 `GET /v1/responses` 和 `GET /responses` 的原生 WebSocket 升级，使用相同 Bearer Key 鉴权。暂不提供 Chat Completions、后台生成及账户对象引用；HTTP 入口要求完整历史，不接受非空 `previous_response_id`。正文中的消息、工具调用、工具结果及响应 ID 随内容透传，避免破坏密文绑定的对象身份；仅兼容还原旧版本发给客户端的 ID 别名。会话、线程和父子关系等客户端元数据继续成组映射。客户端携带的加密 reasoning、compaction、工具参数和内部内容元数据原样透传，包括首次接入、重启续接及跨账户迁移；网关不解密、不持久化内容摘要，也不按本地历史记录拦截密文，有效性由上游处理。升级会清理旧版本保存的密文摘要。
 
 `x-codex-turn-state` 仅用于观察：客户端传入值仍然丢弃，不向上游转发，也不据此改变账户、路由或恢复策略。请求详情的「Turn State 观察」记录客户端传入值及每次上游响应返回值（含 HTTP 错误和恢复补发），区分未携带、空值、多值和历史未采集。普通 Responses 不回传该响应头；Compact 维持原有回传行为。值默认折叠展示，限管理员详情读取，不进入请求列表或普通运行日志；不根据字段值判断模型质量。
 
 每侧每次采集最多 8 个值、合计 64 KiB 原始字节；超过上限明确标记截断或省略。有效 UTF-8 保留原值，其他字节使用 Base64 表示，不解析字段内部内容。入站值随请求明细保留，上游值随该请求审计事件保留；旧数据不回填。
 
 Responses 请求可携带 `max_output_tokens`，但 Codex OAuth 上游不支持该字段，XXGate 在转发前移除顶层字段（包括 null），避免上游 400。工具参数和输入内容中的同名字段保持不变。该兼容处理不保证客户端指定的输出 Token 上限；仍按上游实际 usage 记录用量和费用。
+
+### 上游 WebSocket 连接复用
+
+账户设置 `responses_websocket_enabled` 默认关闭，开启后该账户的所有 Responses 请求（包括无会话身份的 HTTP 请求）固定使用上游 WS，握手失败或连接池满也不回退 HTTP。关闭时 HTTP 入口使用上游 HTTP，原生 WS 请求仅调度到启用 WS 的账户。Search、Compact、图片和管理接口继续使用 HTTP。旧运行配置的同名全局字段仅保留反序列化兼容，不再参与路由。
+
+统一处理层沿用现有 Header、身份及必要参数处理；传输适配层负责 HTTP → WS 消息封装及 WS → SSE/JSON 响应转换。消息、工具调用和响应内容保持原有处理，不引入正文协议转换。
+
+HTTP 请求的连接按网关 Key、session、thread 和账户绑定 ID 隔离，同线程沿用现有串行调度。无身份请求使用一次性 WS，不保留连接或会话绑定。默认启用 `responses_websocket_incremental_enabled`，可在运行配置页独立关闭：仅当同一连接上已完成的上一轮输入与全部 output 构成下一轮输入的完整前缀，且模型、指令、工具等参数一致时，发送父响应 ID 与新增项。历史编辑、截断、参数变化和压缩保守发送完整输入。连接丢失或重建时清空增量状态，以当前完整 HTTP 请求开始新链。
+
+原生 WS 接受 `response.create`，支持 `generate:false` 预热及客户端 `previous_response_id` 增量；不执行网关自动历史匹配。每条下游连接具有服务端生成的隔离 ID，同一个 Key/session/thread 的不同连接也不共享父响应。每条连接一次执行一个请求，不支持 `stream_id` 多路复用或生成中的 steering。无显式身份时使用网关生成的连接级身份。每条消息重新鉴权并进入现有内存准入、调度、用量与审计流程；客户端断开会取消未完成请求。父响应必须是该上游连接最近完成的响应；断线、过期、绑定/认证变更后无法续接，返回 `previous_response_not_found`，客户端需重新发送完整输入。
+
+连接池最多持有 256 条活动及空闲连接，满载优先淘汰最久未用连接，无可回收连接则返回 `websocket_capacity_exhausted`。空闲 90 秒到期，每 15 秒清理；连接达到 55 分钟后不再复用。复用前用 Ping/Pong 检查连接；完整请求可在派发前重建，增量请求不可丢弃父响应后发送。原生入口最多 256 条连接，闲置超时沿用上游事件空闲超时。连接沿用现有 TLS、代理、URL 校验和连接超时配置。
+
+一旦发送 response.create，断线、取消、格式错误或超限均丢弃连接，不自动重发生成请求。已有 HTTP 加密内容明确拒绝恢复保留，原生 WS 不自动重写/重发增量。复用连接不会重复使用上次握手的请求 ID 或额度响应头；逐轮 `x-codex-turn-metadata` 放入各自 create 事件。Debug 仅记录连接复用、增量、项数及字节数，不记录凭据、正文、响应 ID 或指纹。
+
+HTTP 自动增量状态仅保存于对应 WS 连接内存，包含临时响应 ID、项数和随机连接密钥的 HMAC 指纹；不保留历史正文或新增数据库内容存储。该完整历史匹配仍有线性计算成本，可关闭自动增量而继续使用 WS。原生 WS 不承担此匹配成本。传输增量与上游提示词缓存命中是独立机制，缓存率仍以上游 usage 为准。
 
 ### 上下文压缩
 
@@ -288,3 +304,13 @@ XXGate 接受普通 Responses 客户端，无需来自 Codex。无 session/threa
 模型列表接口 `/models` 和 `/v1/models` 保留标准 `object/data` 列表，同时增加 `models` 完整能力目录。能力目录只从当前 Key 分组内、已启用且允许当前客户端访问的账户中选择，并遵守账户及模型的启用/模型限制。每个模型按订阅 Pro → Plus → Free → 其他或未知的顺序选取一份完整上游对象；同等级按账户 UUID 升序稳定选择。仅将 `slug` 映射为网关对外模型名，其他字段不合并、不推断、不补默认值。订阅来自已有 OAuth 凭据声明；读取目录不会刷新凭据或请求上游。旧缓存未保存完整对象的模型需重新同步后才出现在 `models` 中，标准 `data` 的可见性规则保持不变。该优先级用于能力展示，不改变推理请求的账户调度策略。
 
 本机没有 Docker 时，可安装 PostgreSQL 工具后使用 `XXGATE_TEST_PG_BIN=/path/to/postgresql/bin python3 scripts/test.py`。该方式在临时目录和随机本机端口创建独立测试集群，测试结束自动停止并删除；不连接现有数据库、不注册后台服务。
+
+### 实时资源遥测
+
+后台总览的「实时资源」显示当前实例 CPU 配额占用、单核口径 CPU、容器内存、执行中/排队曲线，以及接收/完成/失败速率、CPU 限流周期和采样延迟。每秒采样，页面每 2 秒更新，内存保留最近 300 点；刷新页面可取回最近 5 分钟，进程重启清空历史。不受账户筛选影响，不写数据库，不采集正文或凭据。页面隐藏或离开总览时暂停轮询，失败保留上次数据并标记延迟。
+
+管理员接口 `GET /api/admin/telemetry?since=<毫秒时间戳>` 支持增量读取。Linux cgroup v2 从 cpu.stat/cpu.max/cpuset 获取实例 CPU 用量和容量：单核口径 100% 表示一个核，CPU 配额占用 100% 表示用满实例可用容量。容器 memory.current 包括缓存与网络内存，可能高于 docker stats；限流周期只统计当前 cgroup 的配额限流，不代表全部等待时间。无 cgroup v2 的开发环境明确显示 CPU/容器内存不可用，排队与请求速率仍采集。采样文件读取在阻塞线程池运行，不在请求或抓取接口内调用系统命令。
+
+## 多节点容量扩展
+
+支持统一入口 + 独立账号池工作节点 + 共享 PostgreSQL。统一 Web 汇总账户、请求与用量，已有单节点配置继续可用。配置、历史数据升级和路由边界见 [多节点部署说明](docs/cluster.md)，完整拓扑示例见 [compose.cluster.yaml](compose.cluster.yaml)。

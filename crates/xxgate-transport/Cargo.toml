@@ -20,9 +20,15 @@ tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
 url.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+uuid.workspace = true
 
 wreq = { version = "=6.0.0-rc.31", features = ["stream", "gzip", "brotli", "deflate"] }
 wreq-util = "=3.0.0-rc.14"
+tokio-tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"] }
 
 # Linux also links OpenSSL for the existing native transport.
 [target.'cfg(target_os = "linux")'.dependencies]

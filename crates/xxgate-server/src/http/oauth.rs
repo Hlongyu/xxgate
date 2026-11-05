@@ -94,6 +94,9 @@ pub async fn start(State(s): State<AppState>, Json(input): Json<Start>) -> ApiRe
             .ok_or_else(Error::not_found)?;
     }
     let id = Uuid::new_v4();
+    if let Some(cluster) = &s.cluster {
+        cluster.store.put_operation(id).await?;
+    }
     {
         let mut flows = s.oauth.lock().await;
         flows.retain(|_, flow| flow.expires > Instant::now());
@@ -232,6 +235,7 @@ pub(super) async fn save_credentials(
             access_kind: "codex_oauth".into(),
             enabled: false,
             codex_only: false,
+            responses_websocket_enabled: false,
             use_extra_credits: false,
             disable_reason: Some(DisableReason::AdminDisabled),
             max_inflight: s.gateway.settings.current().default_account_concurrency,

@@ -5,6 +5,10 @@ use tokio::time::{Duration, Instant};
 use xxgate_core::accounts::DisableReason;
 
 pub fn start(state: AppState) {
+    if state.cluster.as_ref().is_some_and(|c| c.router) {
+        return;
+    }
+    state.telemetry.start(state.gateway.clone());
     let quotas = state.clone();
     state.gateway.tasks.spawn(async move {
         let mut config = quotas.gateway.settings.subscribe();
@@ -72,6 +76,18 @@ pub fn start(state: AppState) {
     });
 }
 pub async fn cleanup_once(state: &AppState) {
+    let _leader = if let Some(cluster) = &state.cluster {
+        match cluster.store.maintenance_lock().await {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(code=%error.code,"cleanup lock failed");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let settings = state.gateway.settings.current();
     {
         let mut status = state.cleanup.write().await;

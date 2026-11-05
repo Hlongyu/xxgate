@@ -33,9 +33,21 @@ async fn current_quotas_backfill_ordering_atomicity_and_history_cleanup() {
         .unwrap();
     sqlx::raw_sql("CREATE TABLE quota_snapshots (id BIGSERIAL PRIMARY KEY,account_id UUID NOT NULL,pool TEXT NOT NULL,window_minutes BIGINT NOT NULL,observed_at TIMESTAMPTZ NOT NULL,data JSONB NOT NULL)")
         .execute(&pool).await.unwrap();
-    let store = PgStore { pool };
+    let store = PgStore {
+        pool,
+        node_id: "default".into(),
+    };
     let account = Uuid::new_v4();
     let other = Uuid::new_v4();
+    // The current store verifies account ownership before writing observations.
+    sqlx::raw_sql("CREATE TABLE accounts(id UUID PRIMARY KEY,node_id TEXT NOT NULL DEFAULT 'default',deleted_at TIMESTAMPTZ)")
+        .execute(&store.pool).await.unwrap();
+    sqlx::query("INSERT INTO accounts(id) VALUES($1),($2)")
+        .bind(account)
+        .bind(other)
+        .execute(&store.pool)
+        .await
+        .unwrap();
     let now = Utc::now();
     let window = QuotaWindow {
         pool: "codex".into(),

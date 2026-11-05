@@ -19,7 +19,7 @@ pub(super) async fn catalog(
     models: &[ModelSpec],
 ) -> Result<Vec<Value>> {
     let mut accounts = Vec::new();
-    for account in state.gateway.scheduler.accounts() {
+    for account in state.visible_accounts().await? {
         if eligible(&account, group_id, source)
             && models
                 .iter()

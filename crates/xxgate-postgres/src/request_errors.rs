@@ -148,7 +148,10 @@ mod tests {
         .await
         .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = PgStore { pool };
+        let store = PgStore {
+            pool,
+            node_id: "default".into(),
+        };
         let now = Utc::now();
         let account = Uuid::new_v4();
         let key = Uuid::new_v4();

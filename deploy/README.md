@@ -84,6 +84,8 @@ cd /opt/xxgate
 sha256sum -c xxgate-image.tar.gz.sha256
 gunzip -c xxgate-image.tar.gz | docker load
 docker compose --env-file .env -f compose.production.yaml config --quiet
+docker compose --env-file .env -f compose.production.yaml up -d --no-build --wait xxgate-db
+docker compose --env-file .env -f compose.production.yaml run --rm --no-deps xxgate migrate
 docker compose --env-file .env -f compose.production.yaml up -d --no-build --wait
 ```
 
@@ -116,7 +118,7 @@ docker compose --env-file .env -f compose.production.yaml exec -T xxgate-db \
 cp .env backups/production.env
 ```
 
-恢复时先停止网关，再向空数据库恢复 dump，并使用配套的 `XXGATE_MASTER_KEY`。不要使用带 `-v` 的 `docker compose down` 更新服务，它会删除数据卷。应用启动自动运行数据库迁移。
+恢复时先停止网关，再向空数据库恢复 dump，并使用配套的 `XXGATE_MASTER_KEY`。不要使用带 `-v` 的 `docker compose down` 更新服务，它会删除数据卷。应用启动只校验数据库结构。停止所有使用此数据库的 XXGate 进程后，使用新镜像执行 `xxgate-server migrate`，再启动服务。迁移 0021 不支持仅切回旧镜像回退；多节点部署见 [集群说明](../docs/cluster.md)。
 
 迁移 0010 从最近 8 天仍存在的请求回填账户金额明细和小时汇总。升级前停止旧版本写入，避免漏算；若回退到迁移 0010 之前的程序，随后再次升级必须在停写与备份后重建相关派生统计。回退方案应在隔离副本上验证，不通过覆盖数据库来丢弃当前业务数据。
 

@@ -24,6 +24,7 @@ pub(super) async fn verify(c: &Client, mock: &Mock) {
             let detail = c.record(&id).await;
             let r = &detail["request"];
             assert_eq!(r["request_log_level"], level);
+            assert_eq!(r["upstream_transport"], "http");
             let full = level == "debug" || behavior == "streamfail";
             assert_eq!(r["detail_level"], if full { "full" } else { "summary" });
             assert_eq!(!r["ingress_diagnostics"].is_null(), full);

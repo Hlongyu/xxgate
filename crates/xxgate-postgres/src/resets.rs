@@ -25,6 +25,7 @@ impl ResetStore for PgStore {
             .transpose()
     }
     async fn save_reset_credits(&self, id: Uuid, credits: &ResetCredits) -> Result<()> {
+        self.require_account_owner(id).await?;
         sqlx::query("INSERT INTO account_reset_credits(account_id,data) VALUES($1,$2) ON CONFLICT(account_id) DO UPDATE SET data=excluded.data")
             .bind(id).bind(encode(credits)?).execute(&self.pool).await.map_err(|_| Error::storage())?;
         Ok(())
@@ -39,6 +40,7 @@ impl ResetStore for PgStore {
             .as_ref().map(decode).transpose()
     }
     async fn begin_reset(&self, operation: &ResetOperation) -> Result<()> {
+        self.require_account_owner(operation.account_id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         sqlx::query("INSERT INTO account_reset_operations(id,account_id,data) VALUES($1,$2,$3)")
             .bind(operation.id)
@@ -61,6 +63,7 @@ impl ResetStore for PgStore {
         tx.commit().await.map_err(|_| Error::storage())
     }
     async fn finish_reset(&self, operation: &ResetOperation) -> Result<()> {
+        self.require_account_owner(operation.account_id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let changed = sqlx::query("UPDATE account_reset_operations SET completed=true,data=$3 WHERE account_id=$1 AND id=$2 AND NOT completed")
             .bind(operation.account_id).bind(operation.id).bind(encode(operation)?).execute(&mut *tx).await.map_err(|_| Error::storage())?.rows_affected();

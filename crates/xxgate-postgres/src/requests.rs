@@ -43,14 +43,14 @@ impl RequestStore for PgStore {
     }
     async fn begin_request(&self, r: &RequestRecord) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
-        sqlx::query("INSERT INTO requests(id,key_id,account_id,client_session_id,model,state,created_at,data) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
-            .bind(r.id).bind(r.key_id).bind(r.account_id).bind(&r.client_session_id).bind(&r.model).bind(&r.state).bind(r.created_at).bind(encode(r)?).execute(&mut *tx).await.map_err(|_|Error::storage())?;
+        sqlx::query("INSERT INTO requests(id,key_id,account_id,client_session_id,model,state,created_at,data,node_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+            .bind(r.id).bind(r.key_id).bind(r.account_id).bind(&r.client_session_id).bind(&r.model).bind(&r.state).bind(r.created_at).bind(encode(r)?).bind(&self.node_id).execute(&mut *tx).await.map_err(|_|Error::storage())?;
         event_tx(&mut tx,&AuditEvent::new(if r.state=="rejected" {"request_rejected"}else{"request_accepted"},"gateway",Some(r.id),None,json!({"group_id":r.group_id,"kind":r.kind,"client_origin":r.client_origin,"stateless":r.stateless,"stream":r.stream,"model":r.model,"body_bytes":r.body_bytes,"config_version":r.config_version,"error_code":r.error_code,"diagnostics":if r.state=="rejected" {r.ingress_diagnostics.as_ref()}else{None}}))).await?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(())
     }
     async fn update_request(&self, r: &RequestRecord) -> Result<()> {
-        sqlx::query("UPDATE requests SET account_id=$2,state=$3,data=$4 WHERE id=$1 AND finished_at IS NULL").bind(r.id).bind(r.account_id).bind(&r.state).bind(encode(r)?).execute(&self.pool).await.map_err(|_|Error::storage())?;
+        sqlx::query("UPDATE requests SET account_id=$2,state=$3,data=$4 WHERE id=$1 AND finished_at IS NULL AND node_id=$5").bind(r.id).bind(r.account_id).bind(&r.state).bind(encode(r)?).bind(&self.node_id).execute(&self.pool).await.map_err(|_|Error::storage())?;
         Ok(())
     }
     async fn finish_request(&self, r: &RequestRecord) -> Result<()> {
@@ -58,15 +58,15 @@ impl RequestStore for PgStore {
         let finished_at = r.finished_at.unwrap_or_else(Utc::now);
         let mut data = encode(r)?;
         data["detail_level"] = json!("full");
-        let rows=sqlx::query("UPDATE requests SET account_id=$2,state=$3,finished_at=$4,data=$5 WHERE id=$1 AND finished_at IS NULL")
-            .bind(r.id).bind(r.account_id).bind(&r.state).bind(finished_at).bind(data).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
+        let rows=sqlx::query("UPDATE requests SET account_id=$2,state=$3,finished_at=$4,data=$5 WHERE id=$1 AND finished_at IS NULL AND node_id=$6")
+            .bind(r.id).bind(r.account_id).bind(&r.state).bind(finished_at).bind(data).bind(&self.node_id).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
         if rows == 0 {
             return Ok(());
         }
         let cost = r.valuation.as_ref().and_then(|v| v.cny);
-        sqlx::query("INSERT INTO request_hourly(hour,account_id,key_id,provider,model,service_tier,requests,completed,failed,cancelled,input_tokens,output_tokens,cached_tokens,image_count,cny,unpriced,incomplete_usage,duration_ms,search_calls,search_cny)
-            VALUES(date_trunc('hour',$1::timestamptz),$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-            ON CONFLICT(hour,account_id,key_id,provider,model,service_tier) DO UPDATE SET
+        sqlx::query("INSERT INTO request_hourly(hour,account_id,key_id,provider,model,service_tier,requests,completed,failed,cancelled,input_tokens,output_tokens,cached_tokens,image_count,cny,unpriced,incomplete_usage,duration_ms,search_calls,search_cny,node_id)
+            VALUES(date_trunc('hour',$1::timestamptz),$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            ON CONFLICT(hour,account_id,key_id,provider,model,service_tier,node_id) DO UPDATE SET
             requests=request_hourly.requests+1,completed=request_hourly.completed+EXCLUDED.completed,failed=request_hourly.failed+EXCLUDED.failed,cancelled=request_hourly.cancelled+EXCLUDED.cancelled,
             input_tokens=request_hourly.input_tokens+EXCLUDED.input_tokens,output_tokens=request_hourly.output_tokens+EXCLUDED.output_tokens,cached_tokens=request_hourly.cached_tokens+EXCLUDED.cached_tokens,
             image_count=request_hourly.image_count+EXCLUDED.image_count,cny=request_hourly.cny+EXCLUDED.cny,unpriced=request_hourly.unpriced+EXCLUDED.unpriced,incomplete_usage=request_hourly.incomplete_usage+EXCLUDED.incomplete_usage,duration_ms=request_hourly.duration_ms+EXCLUDED.duration_ms,search_calls=request_hourly.search_calls+EXCLUDED.search_calls,search_cny=request_hourly.search_cny+EXCLUDED.search_cny")
@@ -74,7 +74,7 @@ impl RequestStore for PgStore {
             .bind(i64::from(r.state=="completed")).bind(i64::from(r.state=="failed" || r.state=="interrupted" || r.state=="rejected")).bind(i64::from(r.state=="cancelled"))
             .bind(Decimal::from(r.usage.input_tokens.unwrap_or(0))).bind(Decimal::from(r.usage.output_tokens.unwrap_or(0))).bind(Decimal::from(r.usage.cached_input_tokens.unwrap_or(0)))
             .bind(i64::from(r.usage.image_count)).bind(cost.unwrap_or(Decimal::ZERO)).bind(i64::from(cost.is_none())).bind(i64::from(!r.usage.complete && r.upstream_attempts>0))
-            .bind(Decimal::from(r.total_ms.unwrap_or(0))).bind(i64::try_from(r.usage.search_calls).map_err(|_|Error::storage())?).bind(if r.kind == xxgate_core::protocol::RequestKind::Search { cost.unwrap_or(Decimal::ZERO) } else { Decimal::ZERO }).execute(&mut *tx).await.map_err(|_|Error::storage())?;
+            .bind(Decimal::from(r.total_ms.unwrap_or(0))).bind(i64::try_from(r.usage.search_calls).map_err(|_|Error::storage())?).bind(if r.kind == xxgate_core::protocol::RequestKind::Search { cost.unwrap_or(Decimal::ZERO) } else { Decimal::ZERO }).bind(&self.node_id).execute(&mut *tx).await.map_err(|_|Error::storage())?;
         if let Some(account_id) = r.account_id {
             sqlx::query(include_str!("account_spending_increment.sql"))
                 .bind(r.id)
@@ -117,10 +117,12 @@ impl RequestStore for PgStore {
         Ok(())
     }
     async fn reconcile_interrupted(&self) -> Result<u64> {
-        let rows = sqlx::query("SELECT data FROM requests WHERE finished_at IS NULL")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|_| Error::storage())?;
+        let rows =
+            sqlx::query("SELECT data FROM requests WHERE finished_at IS NULL AND node_id=$1")
+                .bind(&self.node_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| Error::storage())?;
         for row in &rows {
             let mut r: RequestRecord = decode(row)?;
             r.finished_at = Some(Utc::now());
@@ -162,6 +164,9 @@ fn request_where<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a RequestFilter) {
                 xxgate_core::protocol::RequestKind::ImageGeneration => "image_generation",
                 xxgate_core::protocol::RequestKind::ImageEdit => "image_edit",
             });
+    }
+    if let Some(v) = &f.node_id {
+        q.push(" AND node_id=").push_bind(v);
     }
     if let Some(v) = f.account_id {
         q.push(" AND account_id=").push_bind(v);
@@ -206,11 +211,12 @@ fn request_report_query(summary: bool) -> String {
     let usage = list_usage("requests.data->'usage'");
     let record = if summary {
         format!("jsonb_build_object(
-            'id',requests.id,'key_id',requests.key_id,'account_id',requests.account_id,
+            'id',requests.id,'node_id',requests.node_id,'key_id',requests.key_id,'account_id',requests.account_id,
             'client_session_id',requests.client_session_id,'model',requests.model,
             'state',requests.state,'created_at',requests.created_at,
             'kind',requests.data->'kind','stateless',requests.data->'stateless',
             'stream',requests.data->'stream','client_origin',requests.data->'client_origin',
+            'upstream_transport',requests.data->'upstream_transport','upstream_attempts',requests.data->'upstream_attempts',
             'provider',requests.data->'provider','upstream_model',requests.data->'upstream_model',
             'binding_id',requests.data->'binding_id','binding_generation',requests.data->'binding_generation',
             'reasoning_effort',requests.data->'reasoning_effort','requested_tier',requests.data->'requested_tier',
@@ -231,6 +237,7 @@ fn request_report_query(summary: bool) -> String {
         "data"
     };
     format!("SELECT {record} || jsonb_build_object(
+        'node_id',requests.node_id,
         'account_name', (SELECT data->>'name' FROM accounts WHERE accounts.id=requests.account_id),
         'price', (SELECT {price} FROM prices WHERE version=(requests.data->'valuation'->>'price_version')::bigint),
         'cache_previous', (SELECT jsonb_build_object(
@@ -319,16 +326,22 @@ impl ReportStore for PgStore {
         };
         let enrichment: Value = row.try_get("data").map_err(|_| Error::storage())?;
         let mut report = encode(&r)?;
-        for field in ["account_name", "price", "cache_previous", "detail_level"] {
+        for field in [
+            "node_id",
+            "account_name",
+            "price",
+            "cache_previous",
+            "detail_level",
+        ] {
             report[field] = enrichment[field].clone();
         }
         Ok(json!({"request":report,"events":events,"bindings":bindings,"mappings":mappings}))
     }
     async fn dashboard(&self, filter: &UsageFilter) -> Result<Value> {
         filter.validate()?;
-        let summary: Value=sqlx::query_scalar("SELECT jsonb_build_object('requests',COALESCE(sum(requests),0),'completed',COALESCE(sum(completed),0),'failed',COALESCE(sum(failed),0),'cancelled',COALESCE(sum(cancelled),0),'input_tokens',COALESCE(sum(input_tokens),0)::text,'output_tokens',COALESCE(sum(output_tokens),0)::text,'cached_tokens',COALESCE(sum(cached_tokens),0)::text,'images',COALESCE(sum(image_count),0),'search_calls',COALESCE(sum(search_calls),0),'search_cny',COALESCE(sum(search_cny),0)::text,'cny',COALESCE(sum(cny),0)::text,'unpriced',COALESCE(sum(unpriced),0),'incomplete_usage',COALESCE(sum(incomplete_usage),0),'average_ms',COALESCE(sum(duration_ms)/NULLIF(sum(requests),0),0)) FROM request_hourly WHERE ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6)").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).fetch_one(&self.pool).await.map_err(|_|Error::storage())?;
-        let hourly=sqlx::query("SELECT hour,COALESCE(sum(requests),0)::bigint AS requests,COALESCE(sum(failed),0)::bigint AS failed,COALESCE(sum(input_tokens+output_tokens),0)::text AS tokens FROM request_hourly WHERE hour>=now()-interval '24 hours' AND ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6) GROUP BY hour ORDER BY hour").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).fetch_all(&self.pool).await.map_err(|_|Error::storage())?.iter().map(|r|Ok(json!({"hour":r.try_get::<chrono::DateTime<Utc>,_>("hour").map_err(|_|Error::storage())?,"requests":r.try_get::<i64,_>("requests").map_err(|_|Error::storage())?,"failed":r.try_get::<i64,_>("failed").map_err(|_|Error::storage())?,"tokens":r.try_get::<String,_>("tokens").map_err(|_|Error::storage())?}))).collect::<Result<Vec<Value>>>()?;
-        let models=sqlx::query("SELECT model,COALESCE(sum(requests),0)::bigint AS requests,COALESCE(sum(cny),0)::text AS cny,COALESCE(sum(search_calls),0)::bigint AS search_calls,COALESCE(sum(search_cny),0)::text AS search_cny FROM request_hourly WHERE ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6) GROUP BY model ORDER BY requests DESC").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).fetch_all(&self.pool).await.map_err(|_|Error::storage())?.iter().map(|r|Ok(json!({"model":r.try_get::<String,_>("model").map_err(|_|Error::storage())?,"requests":r.try_get::<i64,_>("requests").map_err(|_|Error::storage())?,"cny":r.try_get::<String,_>("cny").map_err(|_|Error::storage())?,"search_calls":r.try_get::<i64,_>("search_calls").map_err(|_|Error::storage())?,"search_cny":r.try_get::<String,_>("search_cny").map_err(|_|Error::storage())?}))).collect::<Result<Vec<Value>>>()?;
+        let summary: Value=sqlx::query_scalar("SELECT jsonb_build_object('requests',COALESCE(sum(requests),0),'completed',COALESCE(sum(completed),0),'failed',COALESCE(sum(failed),0),'cancelled',COALESCE(sum(cancelled),0),'input_tokens',COALESCE(sum(input_tokens),0)::text,'output_tokens',COALESCE(sum(output_tokens),0)::text,'cached_tokens',COALESCE(sum(cached_tokens),0)::text,'images',COALESCE(sum(image_count),0),'search_calls',COALESCE(sum(search_calls),0),'search_cny',COALESCE(sum(search_cny),0)::text,'cny',COALESCE(sum(cny),0)::text,'unpriced',COALESCE(sum(unpriced),0),'incomplete_usage',COALESCE(sum(incomplete_usage),0),'average_ms',COALESCE(sum(duration_ms)/NULLIF(sum(requests),0),0)) FROM request_hourly WHERE ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6) AND ($7::text IS NULL OR node_id=$7)").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).bind(&filter.node_id).fetch_one(&self.pool).await.map_err(|_|Error::storage())?;
+        let hourly=sqlx::query("SELECT hour,COALESCE(sum(requests),0)::bigint AS requests,COALESCE(sum(failed),0)::bigint AS failed,COALESCE(sum(input_tokens+output_tokens),0)::text AS tokens FROM request_hourly WHERE hour>=now()-interval '24 hours' AND ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6) AND ($7::text IS NULL OR node_id=$7) GROUP BY hour ORDER BY hour").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).bind(&filter.node_id).fetch_all(&self.pool).await.map_err(|_|Error::storage())?.iter().map(|r|Ok(json!({"hour":r.try_get::<chrono::DateTime<Utc>,_>("hour").map_err(|_|Error::storage())?,"requests":r.try_get::<i64,_>("requests").map_err(|_|Error::storage())?,"failed":r.try_get::<i64,_>("failed").map_err(|_|Error::storage())?,"tokens":r.try_get::<String,_>("tokens").map_err(|_|Error::storage())?}))).collect::<Result<Vec<Value>>>()?;
+        let models=sqlx::query("SELECT model,COALESCE(sum(requests),0)::bigint AS requests,COALESCE(sum(cny),0)::text AS cny,COALESCE(sum(search_calls),0)::bigint AS search_calls,COALESCE(sum(search_cny),0)::text AS search_cny FROM request_hourly WHERE ($1::uuid IS NULL OR account_id=$1) AND ($2::uuid IS NULL OR key_id=$2) AND ($3::text IS NULL OR model=$3) AND ($4::text IS NULL OR service_tier=$4) AND ($5::timestamptz IS NULL OR hour >= $5) AND ($6::timestamptz IS NULL OR hour < $6) AND ($7::text IS NULL OR node_id=$7) GROUP BY model ORDER BY requests DESC").bind(filter.account_id).bind(filter.key_id).bind(&filter.model).bind(&filter.service_tier).bind(filter.from).bind(filter.to).bind(&filter.node_id).fetch_all(&self.pool).await.map_err(|_|Error::storage())?.iter().map(|r|Ok(json!({"model":r.try_get::<String,_>("model").map_err(|_|Error::storage())?,"requests":r.try_get::<i64,_>("requests").map_err(|_|Error::storage())?,"cny":r.try_get::<String,_>("cny").map_err(|_|Error::storage())?,"search_calls":r.try_get::<i64,_>("search_calls").map_err(|_|Error::storage())?,"search_cny":r.try_get::<String,_>("search_cny").map_err(|_|Error::storage())?}))).collect::<Result<Vec<Value>>>()?;
         Ok(json!({"summary":summary,"hourly":hourly,"models":models}))
     }
     async fn audit_events(&self, offset: i64, limit: i64) -> Result<Value> {
@@ -354,6 +367,10 @@ impl ReportStore for PgStore {
             .execute(&mut *tx).await.map_err(|_|Error::storage())?;
         let requests=sqlx::query("DELETE FROM requests WHERE finished_at IS NOT NULL AND created_at<now()-make_interval(days=>$1)").bind(cfg.request_retention_days as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
         let events=sqlx::query("DELETE FROM audit_events WHERE (request_id IS NOT NULL AND at<now()-make_interval(days=>$1)) OR (request_id IS NULL AND at<now()-make_interval(days=>$2))").bind(cfg.request_retention_days as i32).bind(cfg.audit_retention_days as i32).execute(&mut *tx).await.map_err(|_|Error::storage())?.rows_affected();
+        sqlx::query("DELETE FROM cluster_operations WHERE expires_at<now()")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| Error::storage())?;
         sqlx::query("DELETE FROM admin_sessions WHERE expires_at<now()")
             .execute(&mut *tx)
             .await
@@ -394,7 +411,10 @@ mod cache_tests {
         .await
         .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let store = PgStore { pool };
+        let store = PgStore {
+            pool,
+            node_id: "default".into(),
+        };
         let key = Uuid::new_v4();
         let start = Utc::now();
         let base = RequestRecord {
@@ -436,6 +456,7 @@ mod cache_tests {
             first_content_ms: None,
             total_ms: Some(100),
             upstream_status: Some(200),
+            upstream_transport: Some(xxgate_core::audit::UpstreamTransportKind::Http),
             upstream_headers_ms: None,
             upstream_request_id: None,
             error_code: None,
@@ -628,7 +649,10 @@ mod safety_tests {
         .execute(&pool)
         .await
         .unwrap();
-        let store = PgStore { pool };
+        let store = PgStore {
+            pool,
+            node_id: "default".into(),
+        };
         for count in [0, 1, 2, 4] {
             let session = SessionKey {
                 key_id: key,

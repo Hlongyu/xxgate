@@ -1,0 +1,70 @@
+# Reuses the existing xxgate production database and data volume.
+# Stop the old xxgate service, run `entry migrate`, then start these services.
+name: xxgate-cluster
+
+x-app: &app
+  image: local/xxgate:${XXGATE_IMAGE_TAG:?required}
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 128
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+x-environment: &environment
+  DATABASE_URL: postgres://xxgate:${XXGATE_DB_PASSWORD:?required}@xxgate-db:5432/xxgate
+  XXGATE_MASTER_KEY: ${XXGATE_MASTER_KEY:?required}
+  XXGATE_ADMIN_PASSWORD: ${XXGATE_ADMIN_PASSWORD:?required}
+  XXGATE_CLUSTER_TOKEN: ${XXGATE_CLUSTER_TOKEN:?required}
+  XXGATE_DB_POOL_SIZE: "8"
+  XXGATE_BIND: 0.0.0.0:8787
+  XXGATE_SECURE_COOKIES: "1"
+
+services:
+  entry:
+    <<: *app
+    environment:
+      <<: *environment
+      XXGATE_ROLE: router
+      XXGATE_NODE_ID: entry
+      XXGATE_NODE_URL: http://xxgate-entry:8787
+    ports: ["127.0.0.1:${XXGATE_HOST_PORT:-8797}:8787"]
+    mem_limit: ${XXGATE_ENTRY_MEMORY:-512m}
+    networks:
+      private: {aliases: [xxgate-entry]}
+      ingress: {aliases: [xxgate]}
+  worker-a:
+    <<: *app
+    environment:
+      <<: *environment
+      XXGATE_ROLE: worker
+      XXGATE_NODE_ID: default
+      XXGATE_NODE_URL: http://xxgate-worker-a:8787
+    mem_limit: ${XXGATE_WORKER_MEMORY:-1g}
+    networks:
+      private: {aliases: [xxgate-worker-a]}
+      egress: {}
+  worker-b:
+    <<: *app
+    environment:
+      <<: *environment
+      XXGATE_ROLE: worker
+      XXGATE_NODE_ID: worker-b
+      XXGATE_NODE_URL: http://xxgate-worker-b:8787
+    mem_limit: ${XXGATE_WORKER_B_MEMORY:-512m}
+    networks:
+      private: {aliases: [xxgate-worker-b]}
+      egress: {}
+
+networks:
+  private:
+    external: true
+    name: ${XXGATE_DATABASE_NETWORK:-xxgate-private}
+  ingress:
+    external: true
+    name: ${XXGATE_SUB2API_NETWORK:-code-internal}
+  egress: {}

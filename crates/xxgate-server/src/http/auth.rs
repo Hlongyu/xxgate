@@ -175,7 +175,7 @@ pub async fn gateway_key(state: &AppState, headers: &HeaderMap) -> Result<Gatewa
                 "A valid gateway API key is required",
             )
         })?;
-    state
+    let key = state
         .gateway
         .store
         .key_by_hash(&secret_hash(secret))
@@ -186,5 +186,7 @@ pub async fn gateway_key(state: &AppState, headers: &HeaderMap) -> Result<Gatewa
                 "invalid_api_key",
                 "The gateway API key is invalid or disabled",
             )
-        })
+        })?;
+    state.gateway.scheduler.update_key(key.clone());
+    Ok(key)
 }

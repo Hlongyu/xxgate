@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageFilter {
+    pub node_id: Option<String>,
     pub account_id: Option<Uuid>,
     pub key_id: Option<Uuid>,
     pub model: Option<String>,
@@ -32,6 +33,7 @@ impl UsageFilter {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestFilter {
+    pub node_id: Option<String>,
     pub client_source: Option<crate::clients::ClientSource>,
     pub kind: Option<crate::protocol::RequestKind>,
     pub account_id: Option<Uuid>,

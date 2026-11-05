@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod catalog;
+mod cluster;
 mod groups;
 mod oauth;
 mod oauth_browser;
@@ -8,6 +9,7 @@ mod public;
 mod public_models;
 mod resets;
 mod subscriptions;
+mod websocket;
 
 use axum::{
     Json, Router,
@@ -26,18 +28,39 @@ use xxgate_core::{Error, application::gateway::Gateway};
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: Arc<Gateway>,
+    pub cluster: Option<Arc<crate::cluster::Cluster>>,
+    pub(crate) telemetry: crate::telemetry::Telemetry,
     pub allow_http: bool,
     pub secure_cookies: bool,
     pub cleanup: Arc<RwLock<Value>>,
     pub(crate) model_sync: Arc<RwLock<catalog::SyncJob>>,
     pub(crate) oauth: Arc<Mutex<HashMap<uuid::Uuid, oauth::Flow>>>,
+    pub(crate) websocket_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) subscription_refresh: Arc<Mutex<()>>,
     pub(crate) login_attempts: Arc<Mutex<Vec<tokio::time::Instant>>>,
 }
 impl AppState {
+    pub async fn visible_accounts(
+        &self,
+    ) -> xxgate_core::Result<Vec<xxgate_core::accounts::Account>> {
+        if let Some(c) = self.cluster.as_ref().filter(|c| c.router) {
+            c.store.all_accounts().await
+        } else {
+            self.gateway.store.accounts().await
+        }
+    }
+    pub async fn account_node(&self, id: uuid::Uuid) -> xxgate_core::Result<String> {
+        if let Some(c) = &self.cluster {
+            c.store.account_node(id).await
+        } else {
+            Ok("default".into())
+        }
+    }
     pub fn new(gateway: Arc<Gateway>, allow_http: bool, secure_cookies: bool) -> Self {
         Self {
             gateway,
+            cluster: None,
+            telemetry: Default::default(),
             allow_http,
             secure_cookies,
             cleanup: Arc::new(RwLock::new(json!({"state":"pending"}))),
@@ -45,6 +68,7 @@ impl AppState {
             oauth: Default::default(),
             login_attempts: Default::default(),
             subscription_refresh: Default::default(),
+            websocket_slots: Arc::new(tokio::sync::Semaphore::new(256)),
         }
     }
 }
@@ -70,6 +94,7 @@ pub type ApiResult<T> = Result<T, ApiError>;
 
 pub fn router(state: AppState) -> Router {
     let admin = Router::new()
+        .route("/nodes", get(crate::cluster::nodes))
         .route("/session", get(auth::session))
         .route("/logout", post(auth::logout))
         .route("/dashboard", get(admin::dashboard))
@@ -138,16 +163,25 @@ pub fn router(state: AppState) -> Router {
             post(oauth_browser::complete),
         )
         .route("/metrics", get(admin::metrics))
+        .route("/telemetry", get(admin::telemetry))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            cluster::admin_dispatch,
+        ))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::guard))
         .layer(DefaultBodyLimit::max(256 * 1024));
     Router::new()
         .route("/", get(index))
         .route("/assets/app.js", get(js))
+        .route("/assets/runtime-telemetry.js", get(runtime_telemetry_js))
         .route("/assets/cache-metrics.js", get(cache_metrics_js))
         .route("/assets/account-quotas.js", get(account_quotas_js))
         .route("/assets/error-center.js", get(error_center_js))
         .route("/assets/app.css", get(css))
         .route("/healthz", get(health))
+        .route("/readyz", get(ready))
+        .route("/internal/reload", post(cluster::reload))
+        .route("/internal/websocket/{id}", axum::routing::delete(cluster::close_websocket))
         .route("/api/admin/login", post(auth::login).layer(DefaultBodyLimit::max(4096)))
         .nest("/api/admin", admin)
         // Compress the management UI and JSON, including local development.
@@ -159,8 +193,8 @@ pub fn router(state: AppState) -> Router {
         .route("/images/generations", post(public::image_generations))
         .route("/v1/images/edits", post(public::image_edits))
         .route("/images/edits", post(public::image_edits))
-        .route("/v1/responses", post(public::responses))
-        .route("/responses", post(public::responses))
+        .route("/v1/responses", post(public::responses).get(websocket::responses))
+        .route("/responses", post(public::responses).get(websocket::responses))
         .route("/v1/responses/compact", post(public::compact))
         .route("/responses/compact", post(public::compact))
         .route("/v1/alpha/search", post(public::search))
@@ -187,6 +221,25 @@ async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(
         json!({"status":"ok","version":env!("CARGO_PKG_VERSION")}),
     ))
+}
+async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let _ = health(State(state.clone())).await?;
+    if let Some(cluster) = state.cluster.as_ref().filter(|c| c.router)
+        && !cluster
+            .store
+            .nodes()
+            .await?
+            .iter()
+            .any(|n| n.role == "worker" && n.online && n.accepting)
+    {
+        return Err(Error::new(
+            503,
+            "no_ready_worker",
+            "No worker is ready to accept new sessions",
+        )
+        .into());
+    }
+    Ok(Json(json!({"status":"ready"})))
 }
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -240,6 +293,14 @@ async fn error_center_js() -> Response {
     (
         [("content-type", "text/javascript; charset=utf-8")],
         Body::from(include_str!("../../web/error-center.js")),
+    )
+        .into_response()
+}
+
+async fn runtime_telemetry_js() -> Response {
+    (
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("../../web/runtime-telemetry.js"),
     )
         .into_response()
 }

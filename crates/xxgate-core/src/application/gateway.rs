@@ -3,7 +3,7 @@ use crate::{
     Error, Result,
     access::{CredentialCipher, GatewayKey},
     accounts::{Account, Credentials, DisableReason},
-    audit::{AuditEvent, RequestRecord},
+    audit::{AuditEvent, RequestRecord, UpstreamTransportKind},
     identity::{IdentityMap, SessionKey, ThreadKey},
     pricing::{Price, value_usage},
     protocol::{
@@ -182,7 +182,10 @@ impl Gateway {
             },
             key.group_id,
             model.upstream.clone(),
-            request.client_origin.source,
+            crate::scheduling::DispatchPolicy {
+                source: request.client_origin.source,
+                require_websocket: request.websocket_session.is_some(),
+            },
             since,
         )?;
         let record = RequestRecord {
@@ -225,6 +228,7 @@ impl Gateway {
             first_content_ms: None,
             total_ms: None,
             upstream_status: None,
+            upstream_transport: None,
             upstream_headers_ms: None,
             upstream_request_id: None,
             error_code: None,
@@ -344,7 +348,10 @@ impl Gateway {
                 },
                 e.record.group_id.ok_or_else(Error::storage)?,
                 model.upstream.clone(),
-                request.client_origin.source,
+                crate::scheduling::DispatchPolicy {
+                    source: request.client_origin.source,
+                    require_websocket: request.websocket_session.is_some(),
+                },
                 since,
             )?,
         };
@@ -490,6 +497,13 @@ impl Gateway {
         e.record.queue_ms = Some(since.elapsed().as_millis() as u64);
         e.record.state = "inflight".into();
         e.record.upstream_attempts = 1;
+        e.record.upstream_transport = Some(
+            if request.kind == RequestKind::Responses && lease.account.responses_websocket_enabled {
+                UpstreamTransportKind::Websocket
+            } else {
+                UpstreamTransportKind::Http
+            },
+        );
         self.store.update_request(&e.record).await?;
         if let Some(rewrite) = rewrite {
             self.store.append_event(&AuditEvent::new("request_rewritten", "gateway", Some(e.record.id), e.record.account_id,
@@ -507,9 +521,51 @@ impl Gateway {
                 e.record.upstream_attempts = sent_attempts;
                 return Err(error);
             }
+            // Shared Key policy is checked at the dispatch boundary, including
+            // queued requests and the one explicitly permitted recovery attempt.
+            let key_check = async {
+                let current_key = self
+                    .store
+                    .key_by_id(e.record.key_id)
+                    .await?
+                    .filter(|k| k.enabled)
+                    .ok_or_else(|| {
+                        Error::new(
+                            401,
+                            "invalid_api_key",
+                            "The gateway API key is invalid or disabled",
+                        )
+                    })?;
+                if current_key.group_id != lease.binding.group_id {
+                    return Err(Error::new(
+                        409,
+                        "key_group_changed",
+                        "The key group changed before dispatch",
+                    ));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = key_check {
+                e.record.upstream_attempts = sent_attempts;
+                return Err(error);
+            }
             sent_attempts += 1;
             let attempt_started = Instant::now();
-            let sending = self.transport.send_once(prepared.clone(), cancel.clone());
+            let connection = (e.record.upstream_transport
+                == Some(UpstreamTransportKind::Websocket))
+            .then(|| crate::protocol::ResponseConnectionKey {
+                websocket_session: request.websocket_session,
+                reusable: !request.stateless,
+                thread: ThreadKey {
+                    session: lease.binding.session.clone(),
+                    client_thread_id: request.identity.thread_id.clone(),
+                },
+                binding_id: lease.binding.id,
+            });
+            let sending =
+                self.transport
+                    .send_response(prepared.clone(), connection, cancel.clone());
             tokio::pin!(sending);
             let mut response = loop {
                 let snapshot = cfg.borrow_and_update().clone();
@@ -536,7 +592,7 @@ impl Gateway {
                     "gateway",
                     Some(e.record.id),
                     e.record.account_id,
-                    json!({"attempt":e.record.upstream_attempts,"status":response.status,
+                    json!({"attempt":e.record.upstream_attempts,"status":response.status,"transport":e.record.upstream_transport,
                     "headers_ms":attempt_started.elapsed().as_millis() as u64,
                     "upstream_request_id":e.record.upstream_request_id,
                     "turn_state":crate::turn_state::TurnStateHeader::capture(&response.headers)}),
@@ -564,7 +620,8 @@ impl Gateway {
                         result=&mut reading=>break result?,
                     }
                 };
-                if e.record.upstream_attempts == 1
+                if request.websocket_session.is_none()
+                    && e.record.upstream_attempts == 1
                     && let Some(cleanup) = self.provider.recover_encrypted_reasoning(
                         request.kind,
                         &mut prepared,
@@ -606,7 +663,8 @@ impl Gateway {
                 return self.receive_unary(response.bytes, e, since, started).await;
             }
             let mut decoder = self.provider.decoder();
-            let mut buffering = e.record.upstream_attempts == 1
+            let mut buffering = request.websocket_session.is_none()
+                && e.record.upstream_attempts == 1
                 && self.provider.has_recoverable_encrypted_input(&prepared);
             let mut preamble = Vec::new();
             let mut preamble_bytes = 0usize;
@@ -902,6 +960,9 @@ impl Gateway {
         since: Instant,
     ) -> Result<()> {
         e.record.finished_at = Some(Utc::now());
+        if e.record.upstream_attempts == 0 {
+            e.record.upstream_transport = None;
+        }
         e.record.total_ms = Some(since.elapsed().as_millis() as u64);
         e.record.state = error
             .map_or("completed", |error| {

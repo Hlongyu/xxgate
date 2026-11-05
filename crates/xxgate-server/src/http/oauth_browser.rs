@@ -31,6 +31,9 @@ pub async fn start(State(s): State<AppState>, Json(input): Json<Start>) -> ApiRe
     }
     let auth = BrowserAuthorization::new();
     let id = Uuid::new_v4();
+    if let Some(cluster) = &s.cluster {
+        cluster.store.put_operation(id).await?;
+    }
     let value = json!({"id":id,"status":"pending","authorization_url":auth.authorization_url()?,"redirect_uri":REDIRECT_URI,"expires_in":900});
     let mut flows = s.oauth.lock().await;
     flows.retain(|_, f| f.expires > Instant::now());

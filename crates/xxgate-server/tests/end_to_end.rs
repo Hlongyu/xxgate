@@ -45,6 +45,9 @@ mod stream_recovery_contract;
 #[path = "support/turn_state.rs"]
 mod turn_state_contract;
 
+#[path = "support/long_streams.rs"]
+mod long_streams_contract;
+
 use axum::{
     Json, Router,
     body::Body,

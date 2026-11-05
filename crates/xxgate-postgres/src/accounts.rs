@@ -14,32 +14,70 @@ use xxgate_core::{
 #[derive(Clone)]
 pub struct PgStore {
     pub(crate) pool: PgPool,
+    pub(crate) node_id: String,
 }
 impl PgStore {
     pub async fn connect(url: &str) -> Result<Self> {
+        let store = Self::open(url).await?;
+        store.migrate().await?;
+        Ok(store)
+    }
+
+    /// Opens a pool without changing schema. Production startup uses this path.
+    pub async fn open(url: &str) -> Result<Self> {
+        let pool_size = std::env::var("XXGATE_DB_POOL_SIZE")
+            .ok()
+            .map(|v| v.parse::<u32>())
+            .transpose()
+            .map_err(|_| Error::invalid("XXGATE_DB_POOL_SIZE must be an integer"))?
+            .unwrap_or(24);
+        if !(2..=128).contains(&pool_size) {
+            return Err(Error::invalid(
+                "XXGATE_DB_POOL_SIZE must be between 2 and 128",
+            ));
+        }
         let pool = PgPoolOptions::new()
-            .max_connections(24)
+            .max_connections(pool_size)
             .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(url)
             .await
             .map_err(|_| Error::storage())?;
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|_| Error::new(503, "migration_failed", "Database migrations failed"))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            node_id: "default".into(),
+        })
     }
-    pub async fn single_instance_lock(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
-        let mut connection = self.pool.acquire().await.map_err(|_| Error::storage())?;
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(848847415, 1)")
-            .fetch_one(&mut *connection)
+    pub async fn single_instance_lock(&self) -> Result<sqlx::PgConnection> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| Error::storage())?
+            .detach();
+        // The old single-instance lock doubles as a migration gate. New nodes
+        // share it, while migrations and legacy processes require it exclusively.
+        let shared: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared(848847415,1)")
+            .fetch_one(&mut connection)
             .await
             .map_err(|_| Error::storage())?;
+        if !shared {
+            return Err(Error::new(
+                503,
+                "migration_or_legacy_instance_running",
+                "Stop the legacy instance or wait for the migration before starting this node",
+            ));
+        }
+        let locked: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(848847418, hashtext($1))")
+                .bind(&self.node_id)
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| Error::storage())?;
         if !locked {
             return Err(Error::new(
                 503,
                 "instance_already_running",
-                "Another XXGate instance is using this database",
+                "Another XXGate instance is using this node ID",
             ));
         }
         Ok(connection)
@@ -73,6 +111,7 @@ impl AccountStore for PgStore {
         id: Uuid,
         catalog: &xxgate_core::providers::AccountModelCatalog,
     ) -> Result<Account> {
+        self.require_account_owner(id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let row =
             sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
@@ -93,6 +132,7 @@ impl AccountStore for PgStore {
         Ok(account)
     }
     async fn delete_account(&self, id: Uuid) -> Result<()> {
+        self.require_account_owner(id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let changed = sqlx::query("UPDATE accounts SET deleted_at=now(),enabled=false,version=version+1,updated_at=now(),data=data || jsonb_build_object('enabled',false,'disable_reason','admin_disabled','version',version+1) WHERE id=$1 AND deleted_at IS NULL")
             .bind(id).execute(&mut *tx).await.map_err(|_| Error::storage())?.rows_affected();
@@ -118,7 +158,8 @@ impl AccountStore for PgStore {
         tx.commit().await.map_err(|_| Error::storage())
     }
     async fn accounts(&self) -> Result<Vec<Account>> {
-        sqlx::query("SELECT data FROM accounts WHERE deleted_at IS NULL ORDER BY updated_at DESC")
+        sqlx::query("SELECT data FROM accounts WHERE deleted_at IS NULL AND node_id=$1 ORDER BY updated_at DESC")
+            .bind(&self.node_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|_| Error::storage())?
@@ -132,7 +173,24 @@ impl AccountStore for PgStore {
         encrypted: Option<&[u8]>,
         expected_version: Option<i64>,
     ) -> Result<Account> {
+        if expected_version.is_some() {
+            self.require_account_owner(account.id).await?;
+        }
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
+        // Serialize duplicate checks across nodes, including concurrent imports.
+        sqlx::query("SELECT pg_advisory_xact_lock(848847416,hashtext($1))")
+            .bind(&account.upstream_account_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| Error::storage())?;
+        let duplicate: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE deleted_at IS NULL AND id<>$1 AND data->>'provider'=$2 AND data->>'upstream_account_id'=$3)").bind(account.id).bind(&account.provider).bind(&account.upstream_account_id).fetch_one(&mut *tx).await.map_err(|_| Error::storage())?;
+        if duplicate {
+            return Err(Error::new(
+                409,
+                "account_already_exists",
+                "This upstream account already belongs to a node",
+            ));
+        }
         super::groups::validate_groups(&mut tx, &account.group_ids).await?;
         let mut account = account.clone();
         account.updated_at = Utc::now();
@@ -159,8 +217,8 @@ impl AccountStore for PgStore {
                 .bind(account.id).bind(account.version).bind(account.credential_version).bind(account.enabled).bind(encode(&account)?).bind(encrypted).execute(&mut *tx).await.map_err(|_| Error::storage())?;
         } else {
             account.credential_version = 1;
-            sqlx::query("INSERT INTO accounts(id,version,credential_version,enabled,data,credentials) VALUES($1,$2,$3,$4,$5,$6)")
-                .bind(account.id).bind(account.version).bind(account.credential_version).bind(account.enabled).bind(encode(&account)?).bind(encrypted.ok_or_else(|| Error::invalid("Credentials are required"))?).execute(&mut *tx).await.map_err(|_| Error::storage())?;
+            sqlx::query("INSERT INTO accounts(id,version,credential_version,enabled,data,credentials,node_id) VALUES($1,$2,$3,$4,$5,$6,$7)")
+                .bind(account.id).bind(account.version).bind(account.credential_version).bind(account.enabled).bind(encode(&account)?).bind(encrypted.ok_or_else(|| Error::invalid("Credentials are required"))?).bind(&self.node_id).execute(&mut *tx).await.map_err(|_| Error::storage())?;
         }
         sqlx::query("DELETE FROM account_groups WHERE account_id=$1")
             .bind(account.id)
@@ -175,7 +233,7 @@ impl AccountStore for PgStore {
                 .await
                 .map_err(|_| Error::storage())?;
         }
-        event_tx(&mut tx, &AuditEvent::new(if expected_version.is_some() { "account_updated" } else { "account_created" }, "admin", None, Some(account.id), json!({"version":account.version,"name":account.name,"enabled":account.enabled,"codex_only":account.codex_only,"use_extra_credits":account.use_extra_credits,"max_inflight":account.max_inflight,"group_ids":account.group_ids}))).await?;
+        event_tx(&mut tx, &AuditEvent::new(if expected_version.is_some() { "account_updated" } else { "account_created" }, "admin", None, Some(account.id), json!({"version":account.version,"name":account.name,"enabled":account.enabled,"codex_only":account.codex_only,"responses_websocket_enabled":account.responses_websocket_enabled,"use_extra_credits":account.use_extra_credits,"max_inflight":account.max_inflight,"group_ids":account.group_ids}))).await?;
         tx.commit().await.map_err(|_| Error::storage())?;
         Ok(account)
     }
@@ -194,6 +252,7 @@ impl AccountStore for PgStore {
         expires_at: Option<DateTime<Utc>>,
         expected_version: i64,
     ) -> Result<Account> {
+        self.require_account_owner(id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let row =
             sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
@@ -222,6 +281,7 @@ impl AccountStore for PgStore {
         expected_version: i64,
         actor: &str,
     ) -> Result<Account> {
+        self.require_account_owner(id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let row =
             sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
@@ -279,6 +339,7 @@ impl AccountStore for PgStore {
         expected: &Account,
         snapshot: &xxgate_core::accounts::SubscriptionSnapshot,
     ) -> Result<()> {
+        self.require_account_owner(expected.id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         let row =
             sqlx::query("SELECT data FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE")
@@ -329,12 +390,14 @@ impl AccountStore for PgStore {
         id: Uuid,
         credits: &xxgate_core::quota::ExtraCredits,
     ) -> Result<()> {
+        self.require_account_owner(id).await?;
         sqlx::query("INSERT INTO account_extra_credits(account_id,observed_at,data) VALUES($1,$2,$3) ON CONFLICT(account_id) DO UPDATE SET observed_at=EXCLUDED.observed_at,data=EXCLUDED.data WHERE account_extra_credits.observed_at<=EXCLUDED.observed_at")
             .bind(id).bind(credits.observed_at).bind(encode(credits)?)
             .execute(&self.pool).await.map_err(|_| Error::storage())?;
         Ok(())
     }
     async fn save_quotas(&self, id: Uuid, windows: &[QuotaWindow]) -> Result<()> {
+        self.require_account_owner(id).await?;
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         for w in windows {
             sqlx::query("INSERT INTO quota_snapshots(account_id,pool,window_minutes,observed_at,data) VALUES($1,$2,$3,$4,$5)").bind(id).bind(&w.pool).bind(w.window_minutes.unwrap_or(-1)).bind(w.observed_at).bind(encode(w)?).execute(&mut *tx).await.map_err(|_| Error::storage())?;

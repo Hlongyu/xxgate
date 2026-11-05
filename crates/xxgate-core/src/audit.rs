@@ -34,6 +34,13 @@ impl AuditEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTransportKind {
+    Http,
+    Websocket,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestRecord {
     /// Captured at admission; None preserves diagnostics for legacy records.
@@ -84,6 +91,10 @@ pub struct RequestRecord {
     pub first_content_ms: Option<u64>,
     pub total_ms: Option<u64>,
     pub upstream_status: Option<u16>,
+    /// Transport selected at dispatch, never inferred from the account later.
+    /// None covers legacy records and requests with no upstream dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_transport: Option<UpstreamTransportKind>,
     #[serde(default)]
     pub upstream_headers_ms: Option<u64>,
     pub upstream_request_id: Option<String>,
@@ -127,6 +138,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!record.summary_only()); // Legacy records retain their details.
+        assert_eq!(record.upstream_transport, None);
         for level in [LogLevel::Info, LogLevel::Warn, LogLevel::Error] {
             record.request_log_level = Some(level);
             assert!(record.summary_only());

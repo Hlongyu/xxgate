@@ -110,6 +110,41 @@ pub(crate) fn coherent(
 }
 
 pub(crate) fn parse(headers: &HeaderMap, body: Value, kind: RequestKind) -> Result<GatewayRequest> {
+    parse_with_transport(headers, body, kind, None)
+}
+
+pub fn parse_websocket(headers: &HeaderMap, body: Value, session: Uuid) -> Result<GatewayRequest> {
+    if body.get("type").and_then(Value::as_str) != Some("response.create") {
+        return Err(Error::invalid("Expected response.create"));
+    }
+    if body.get("generate").is_some_and(|v| !v.is_boolean()) {
+        return Err(Error::invalid("generate must be a boolean"));
+    }
+    if body.get("previous_response_id").is_some_and(|v| {
+        !v.is_null()
+            && !v.as_str().is_some_and(|s| {
+                !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control)
+            })
+    }) {
+        return Err(Error::invalid("Invalid previous_response_id"));
+    }
+    let mut parsed = parse_with_transport(headers, body, RequestKind::Responses, Some(session))?;
+    if parsed.stateless {
+        let identity = format!("ws:{session}");
+        parsed.identity.session_id = identity.clone();
+        parsed.identity.thread_id = identity;
+        parsed.stateless = false;
+    }
+    parsed.stream = true;
+    Ok(parsed)
+}
+
+fn parse_with_transport(
+    headers: &HeaderMap,
+    body: Value,
+    kind: RequestKind,
+    websocket_session: Option<Uuid>,
+) -> Result<GatewayRequest> {
     let client_origin = crate::client_source::detect(headers, &body);
     let client_metadata_present = body.get("client_metadata").is_some();
     if !body.is_object() {
@@ -156,10 +191,13 @@ pub(crate) fn parse(headers: &HeaderMap, body: Value, kind: RequestKind) -> Resu
             "metadata",
         ]
     };
-    if body
-        .as_object()
-        .is_some_and(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
-    {
+    if body.as_object().is_some_and(|o| {
+        o.keys().any(|k| {
+            !(allowed.contains(&k.as_str())
+                || websocket_session.is_some()
+                    && ["type", "generate", "access_programs"].contains(&k.as_str()))
+        })
+    }) {
         return Err(Error::new(
             400,
             "unsupported_parameter",
@@ -173,9 +211,10 @@ pub(crate) fn parse(headers: &HeaderMap, body: Value, kind: RequestKind) -> Resu
             "Background responses are not supported",
         ));
     }
-    if body
-        .get("previous_response_id")
-        .is_some_and(|v| !v.is_null())
+    if websocket_session.is_none()
+        && body
+            .get("previous_response_id")
+            .is_some_and(|v| !v.is_null())
     {
         return Err(Error::new(
             400,
@@ -255,6 +294,7 @@ pub(crate) fn parse(headers: &HeaderMap, body: Value, kind: RequestKind) -> Resu
         .map(str::to_owned);
     let identifier_inputs = crate::identity_trace::client_identifiers(headers, &body);
     Ok(GatewayRequest {
+        websocket_session,
         client_turn_state: xxgate_core::turn_state::TurnStateHeader::capture(headers),
         client_origin,
         client_metadata_present,

@@ -68,7 +68,7 @@ pub async fn discovered(State(s): State<AppState>) -> ApiResult<Json<Value>> {
     let mut models: BTreeMap<(String, String, String), Value> = BTreeMap::new();
     let mut accounts = vec![];
     let configured = s.gateway.store.models().await?;
-    for account in s.gateway.scheduler.accounts() {
+    for account in s.visible_accounts().await? {
         accounts.push(json!({"id":account.id,"name":account.name,"enabled":account.enabled,"synced_at":account.model_catalog.as_ref().and_then(|c|c.synced_at),"error":account.model_catalog.as_ref().and_then(|c|c.error.clone())}));
         let Some(catalog) = &account.model_catalog else {
             continue;

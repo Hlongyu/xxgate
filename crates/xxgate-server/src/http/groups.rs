@@ -26,7 +26,7 @@ pub(super) async fn validate_selection(s: &AppState, ids: &[Uuid]) -> Result<()>
     Ok(())
 }
 pub async fn list(State(s): State<AppState>) -> ApiResult<Json<Value>> {
-    let accounts = s.gateway.scheduler.accounts();
+    let accounts = s.visible_accounts().await?;
     let keys = s.gateway.store.keys().await?;
     let items = s.gateway.store.groups().await?.into_iter().map(|g| {
         let members: Vec<_> = accounts.iter().filter(|a| a.group_ids.contains(&g.id)).collect();

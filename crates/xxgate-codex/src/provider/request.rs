@@ -122,6 +122,13 @@ pub(crate) fn prepare(
             body.insert(key.into(), value.clone());
         }
     }
+    if r.websocket_session.is_some() {
+        for key in ["previous_response_id", "generate"] {
+            if let Some(value) = source.get(key) {
+                body.insert(key.into(), value.clone());
+            }
+        }
+    }
     // The Codex transport requires a message array and an instructions field,
     // even for ordinary Responses callers that do not provide Codex metadata.
     if let Some(input) = body.get_mut("input") {

@@ -1,0 +1,65 @@
+name: xxgate-cluster
+
+x-node: &node
+  image: local/xxgate:${XXGATE_IMAGE_TAG:-latest}
+  restart: unless-stopped
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  stop_grace_period: 45s
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+x-environment: &environment
+  DATABASE_URL: postgres://xxgate:${XXGATE_DB_PASSWORD:?required}@postgres:5432/xxgate
+  XXGATE_DB_POOL_SIZE: "8"
+  XXGATE_MASTER_KEY: ${XXGATE_MASTER_KEY:?required}
+  XXGATE_ADMIN_PASSWORD: ${XXGATE_ADMIN_PASSWORD:?required}
+  XXGATE_CLUSTER_TOKEN: ${XXGATE_CLUSTER_TOKEN:?required}
+  XXGATE_BIND: 0.0.0.0:8787
+  XXGATE_SECURE_COOKIES: ${XXGATE_SECURE_COOKIES:-1}
+
+services:
+  entry:
+    <<: *node
+    environment:
+      <<: *environment
+      XXGATE_ROLE: router
+      XXGATE_NODE_ID: entry
+      XXGATE_NODE_URL: http://entry:8787
+    ports: ["127.0.0.1:${XXGATE_CLUSTER_PORT:-8797}:8787"]
+    mem_limit: 1g
+  worker-a:
+    <<: *node
+    environment:
+      <<: *environment
+      XXGATE_ROLE: worker
+      XXGATE_NODE_ID: default
+      XXGATE_NODE_URL: http://worker-a:8787
+    mem_limit: 1g
+  worker-b:
+    <<: *node
+    environment:
+      <<: *environment
+      XXGATE_ROLE: worker
+      XXGATE_NODE_ID: worker-b
+      XXGATE_NODE_URL: http://worker-b:8787
+    mem_limit: 1g
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: xxgate
+      POSTGRES_PASSWORD: ${XXGATE_DB_PASSWORD:?required}
+      POSTGRES_DB: xxgate
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U xxgate -d xxgate"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres_data:

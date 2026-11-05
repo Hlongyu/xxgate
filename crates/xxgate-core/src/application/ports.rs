@@ -98,6 +98,7 @@ pub trait AccessStore: Send + Sync {
     async fn put_admin_session(&self, hash: &str, session: &AdminSession) -> Result<()>;
     async fn admin_session(&self, hash: &str) -> Result<Option<AdminSession>>;
     async fn delete_admin_session(&self, hash: &str) -> Result<()>;
+    async fn key_by_id(&self, id: Uuid) -> Result<Option<GatewayKey>>;
     async fn keys(&self) -> Result<Vec<GatewayKey>>;
     async fn put_key(&self, key: &GatewayKey, hash: &str) -> Result<()>;
     async fn key_by_hash(&self, hash: &str) -> Result<Option<GatewayKey>>;

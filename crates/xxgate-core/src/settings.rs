@@ -33,6 +33,10 @@ pub struct RuntimeSettings {
     pub heartbeat_interval_ms: u64,
     pub connect_timeout_ms: u64,
     pub sse_idle_timeout_ms: u64,
+    /// Legacy compatibility field; transport is now selected per account.
+    pub responses_websocket_enabled: bool,
+    /// Send only appended items when the complete previous context matches.
+    pub responses_websocket_incremental_enabled: bool,
     pub queue_capacity: usize,
     /// Legacy configuration, retained for old clients; no longer used for admission.
     pub queue_memory_bytes: usize,
@@ -59,6 +63,8 @@ impl Default for RuntimeSettings {
             heartbeat_interval_ms: 10_000,
             connect_timeout_ms: 15_000,
             sse_idle_timeout_ms: 300_000,
+            responses_websocket_enabled: true,
+            responses_websocket_incremental_enabled: true,
             queue_capacity: 2000,
             queue_memory_bytes: 512 * 1024 * 1024,
             memory_reject_percent: 85,

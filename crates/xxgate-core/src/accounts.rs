@@ -49,6 +49,9 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default)]
     pub codex_only: bool,
+    /// Responses always use WS when enabled; no HTTP fallback.
+    #[serde(default)]
+    pub responses_websocket_enabled: bool,
     #[serde(default)]
     pub use_extra_credits: bool,
     pub disable_reason: Option<DisableReason>,

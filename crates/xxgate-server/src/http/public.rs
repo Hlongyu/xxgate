@@ -21,6 +21,7 @@ use xxgate_core::{audit::RequestRecord, pricing::Valuation, usage::Usage};
 pub async fn models(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let key = gateway_key(&state, &headers).await?;
     let source = xxgate_codex::client_source::detect(&headers, &Value::Null).source;
+    let accounts = state.visible_accounts().await?;
     let models = state
         .gateway
         .store
@@ -29,10 +30,11 @@ pub async fn models(State(state): State<AppState>, headers: HeaderMap) -> ApiRes
         .into_iter()
         .filter(|m| {
             m.enabled
-                && state
-                    .gateway
-                    .scheduler
-                    .supports_group_model(key.group_id, &m.upstream, source)
+                && accounts.iter().any(|a| {
+                    a.group_ids.contains(&key.group_id)
+                        && a.accepts(source)
+                        && a.supports(&m.upstream)
+                })
         })
         .collect::<Vec<_>>();
     let capabilities = super::public_models::catalog(&state, key.group_id, source, &models).await?;
@@ -60,7 +62,14 @@ pub async fn image_edits(State(state): State<AppState>, request: Request) -> Res
     handle(state, request, RequestKind::ImageEdit).await
 }
 async fn handle(state: AppState, request: Request, kind: RequestKind) -> Response {
-    let id = Uuid::new_v4();
+    let id = state
+        .cluster
+        .as_ref()
+        .filter(|c| !c.router && c.authenticated(request.headers()))
+        .and_then(|_| request.headers().get(crate::cluster::REQUEST_HEADER))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .unwrap_or_else(Uuid::new_v4);
     let started = tokio::time::Instant::now();
     let created_at = Utc::now();
     let mut context = RejectedContext::default();
@@ -113,6 +122,7 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
                 first_content_ms: None,
                 total_ms: Some(started.elapsed().as_millis() as u64),
                 upstream_status: None,
+                upstream_transport: None,
                 upstream_headers_ms: None,
                 upstream_request_id: None,
                 error_code: Some(error.0.code.clone()),
@@ -156,7 +166,9 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
             response
         }
     };
-    if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
+    if !response.headers().contains_key("x-request-id")
+        && let Ok(value) = HeaderValue::from_str(&id.to_string())
+    {
         response.headers_mut().insert("x-request-id", value);
     }
     response
@@ -314,18 +326,38 @@ async fn responses_inner(
         .filter(|s| s.len() <= 160 && !s.chars().any(char::is_control))
         .unwrap_or("")
         .to_owned();
-    drop(raw);
+    let raw = raw.freeze();
     context.stage = "ingress_validation";
     let mut parsed = match kind {
         RequestKind::Search => {
             xxgate_codex::search::parse(&parts.headers, document, parts.uri.query())?
         }
         RequestKind::Compact => xxgate_codex::compaction::parse(&parts.headers, document)?,
-        RequestKind::Responses => state.gateway.ingress.parse(&parts.headers, document)?,
+        RequestKind::Responses => {
+            let websocket = parts
+                .extensions
+                .get::<super::websocket::Session>()
+                .map(|s| s.0)
+                .or_else(|| {
+                    state
+                        .cluster
+                        .as_ref()
+                        .filter(|c| !c.router && c.authenticated(&parts.headers))
+                        .and_then(|_| parts.headers.get(crate::cluster::WS_HEADER))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                });
+            if let Some(session) = websocket {
+                xxgate_codex::ingress::parse_websocket(&parts.headers, document, session)?
+            } else {
+                state.gateway.ingress.parse(&parts.headers, document)?
+            }
+        }
         RequestKind::ImageGeneration | RequestKind::ImageEdit => {
             xxgate_codex::images::parse(&parts.headers, document, kind)?
         }
     };
+    context.stream = Some(parsed.stream);
     context.stateless = parsed.stateless;
     if !parsed.stateless {
         context.session = parsed.identity.session_id.clone();
@@ -338,6 +370,23 @@ async fn responses_inner(
         .memory_admission
         .check(true)
         .map_err(|rejection| memory_rejection(state, context, *rejection))?;
+    if let Some(cluster) = &state.cluster {
+        if cluster.router {
+            let node = cluster.select(&key, &parsed).await?;
+            let path = parts
+                .uri
+                .path_and_query()
+                .map_or(parts.uri.path(), |p| p.as_str());
+            let websocket = parsed.websocket_session;
+            drop(parsed);
+            drop(_reading);
+            return Ok(cluster
+                .forward_generation(&node, path, parts.headers, raw, websocket, id)
+                .await?);
+        }
+        cluster.check_owner(&key, &parsed).await?;
+    }
+    drop(raw);
     let handle = state.gateway.start(id, key, parsed, length, memory).await?;
     drop(_reading);
     let id = handle.id.to_string();
