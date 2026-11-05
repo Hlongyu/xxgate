@@ -271,6 +271,7 @@ pub fn diagnostics(
             "model",
             "input",
             "stream",
+            "generate",
             "client_metadata",
             "metadata",
             "prompt_cache_key",
@@ -296,7 +297,7 @@ pub fn diagnostics(
             }
         }
     }
-    json!({"client_origin":origin,"method":method,"path":path,"headers":selected,"authorization_present":headers.contains_key("authorization"),"body_status":if body.is_some(){"parsed"}else{"not_parsed"},"body_fields":shape,"identity":if body.is_some(){inspected.report}else{json!({"status":"body_not_parsed","fields":inspected.report["fields"]})}})
+    json!({"client_origin":origin,"method":method,"path":path,"headers":selected,"authorization_present":headers.contains_key("authorization"),"body_status":if body.is_some(){"parsed"}else{"not_parsed"},"body_fields":shape,"generate":body.and_then(|v|v.get("generate")).and_then(Value::as_bool),"identity":if body.is_some(){inspected.report}else{json!({"status":"body_not_parsed","fields":inspected.report["fields"]})}})
 }
 
 #[cfg(test)]

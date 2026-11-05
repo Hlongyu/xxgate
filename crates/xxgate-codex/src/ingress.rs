@@ -11,6 +11,10 @@ use xxgate_core::{
 
 pub struct ResponsesIngress;
 
+#[cfg(test)]
+#[path = "ingress_tests.rs"]
+mod websocket_tests;
+
 pub(crate) fn metadata(body: &Value, headers: &HeaderMap) -> Result<Vec<Value>> {
     let mut result = vec![];
     if let Some(meta) = body.get("client_metadata") {
@@ -68,6 +72,20 @@ pub(crate) fn coherent(
     sources: &[Value],
     field: &str,
 ) -> Result<Option<String>> {
+    coherent_value(headers, header, sources, field, false)
+}
+
+pub(crate) fn turn_id(sources: &[Value], prewarm: bool) -> Result<Option<String>> {
+    coherent_value(&HeaderMap::new(), None, sources, "turn_id", prewarm)
+}
+
+fn coherent_value(
+    headers: &HeaderMap,
+    header: Option<&str>,
+    sources: &[Value],
+    field: &str,
+    allow_empty: bool,
+) -> Result<Option<String>> {
     let mut values = vec![];
     if let Some(header) = header {
         for v in headers.get_all(header) {
@@ -91,7 +109,7 @@ pub(crate) fn coherent(
     }
     if values
         .iter()
-        .any(|v| v.is_empty() || v.len() > 512 || v.chars().any(char::is_control))
+        .any(|v| (!allow_empty && v.is_empty()) || v.len() > 512 || v.chars().any(char::is_control))
     {
         return Err(Error::invalid(
             "Invalid identity field length or characters",
@@ -113,6 +131,12 @@ pub(crate) fn parse(headers: &HeaderMap, body: Value, kind: RequestKind) -> Resu
     parse_with_transport(headers, body, kind, None)
 }
 
+/// Handshake metadata describes connection setup, not subsequent WS turns.
+/// Keep connection identity headers; each message supplies its own turn metadata.
+pub fn strip_websocket_turn_header(headers: &mut HeaderMap) {
+    headers.remove("x-codex-turn-metadata");
+}
+
 pub fn parse_websocket(headers: &HeaderMap, body: Value, session: Uuid) -> Result<GatewayRequest> {
     if body.get("type").and_then(Value::as_str) != Some("response.create") {
         return Err(Error::invalid("Expected response.create"));
@@ -128,7 +152,9 @@ pub fn parse_websocket(headers: &HeaderMap, body: Value, session: Uuid) -> Resul
     }) {
         return Err(Error::invalid("Invalid previous_response_id"));
     }
-    let mut parsed = parse_with_transport(headers, body, RequestKind::Responses, Some(session))?;
+    let mut headers = headers.clone();
+    strip_websocket_turn_header(&mut headers);
+    let mut parsed = parse_with_transport(&headers, body, RequestKind::Responses, Some(session))?;
     if parsed.stateless {
         let identity = format!("ws:{session}");
         parsed.identity.session_id = identity.clone();
@@ -253,7 +279,11 @@ fn parse_with_transport(
         },
         |resolved| (resolved.session_id, resolved.thread_id),
     );
-    let turn_id = coherent(headers, None, &sources, "turn_id")?;
+    // Codex uses INITIAL_SUBMIT_ID="" for generate:false startup prewarm.
+    // Preserve it on the wire, but do not create a real turn identity for it.
+    let prewarm =
+        websocket_session.is_some() && body.get("generate").and_then(Value::as_bool) == Some(false);
+    let turn_id = turn_id(&sources, prewarm)?.filter(|id| !id.is_empty());
     for (field, header) in [
         ("window_id", Some("x-codex-window-id")),
         ("installation_id", Some("x-codex-installation-id")),

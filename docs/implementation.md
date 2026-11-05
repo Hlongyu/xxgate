@@ -296,3 +296,13 @@ Provider 为错误附加可选的白名单上游事实（code/reason/param），
 验证覆盖真实 HTTP→WS、HTTP→HTTP、账户协议切换后的历史记录、成功摘要/失败详情及前端旧记录与未派发状态。本地浏览器以合成数据确认列表和详情布局，未调用线上模型、未修改线上配置。
 
 最终验证：153 项 Rust 测试（含临时 PostgreSQL、真实 HTTP/WebSocket）、27 项前端测试、Clippy 全目标禁止警告、格式和 diff 检查通过。初轮遇到既有会话并发测试提前 EOF，隔离复验通过；随后 WS 契约测试出现 HTTP 429，隔离复验通过；为隔离宿主机内存波动，将该测试的内存探针固定为健康样本（与集群契约一致，内存压力另有专门测试）后全套通过。保留各轮测试日志于 `/tmp/xxgate-transport-ui-*`，未部署线上。
+
+## Codex WebSocket 预热兼容（2026-11-05，本地实现）
+
+Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在 `response.create` 中发送 `generate:false` 和空 `client_metadata.turn_id`；同一连接的正式轮次分别发送新的轮次元数据。依据：[预热请求序列化](https://github.com/openai/codex/blob/rust-v0.166.0-alpha.6/codex-rs/core/src/client.rs#L2302)、[跨轮次元数据测试](https://github.com/openai/codex/blob/rust-v0.166.0-alpha.6/codex-rs/core/tests/suite/client_websockets.rs#L2073)。
+
+仅对原生 WS（含可信集群转发）的 `generate:false` 请求允许空 `turn_id`，平铺与嵌套投影仍须一致；空值向上游保留，但不产生轮次身份映射。正式生成、HTTP 和其他身份字段继续执行原有非空、长度、控制字符及冲突检查。WS 不复用握手的 `x-codex-turn-metadata`，逐消息读取正文中的轮次与父轮次元数据，保留连接会话/线程头；单节点、入口、工作节点使用一致规则。
+
+入站诊断新增 `generate` 的布尔值及 `websocket` 标记，不保存非法 generate 的任意内容。只读查到线上 16:25:23（Asia/Shanghai）的拒绝请求 `60265eff-3531-45b8-b7fc-a10fa2220183`，空 turn_id 已确认，但旧日志未采集 generate，无法确认其是否为预热。
+
+验证：157 项 Rust 测试全部通过（临时 PostgreSQL、真实 HTTP/WS、双工作节点及分片链路），覆盖空 ID 预热后连续两轮生成、原连接与 previous_response_id 复用、每轮平铺/嵌套元数据一致、正式请求及非法值拒绝。Clippy 全目标禁止警告、格式和 diff 检查通过。初轮测试受本机系统代理影响，模拟上游返回 Connection 头缺少 upgrade；显式设置 `NO_PROXY=127.0.0.1,localhost` 后全套通过，未修改系统代理或生产配置。测试日志位于 `/tmp/xxgate-ws-prewarm-tests-direct.log`，未部署线上。

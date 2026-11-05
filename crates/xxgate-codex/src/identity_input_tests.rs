@@ -153,3 +153,28 @@ fn cache_partition_is_not_a_client_session() {
     assert_eq!(result.report["status"], "stateless");
     assert_eq!(result.report["fields"][0]["field"], "prompt_cache_key");
 }
+
+#[test]
+fn diagnostics_record_generate_without_saving_invalid_contents() {
+    for generate in [json!(false), json!(true), json!("PRIVATE_INVALID_GENERATE")] {
+        let body = json!({"generate":generate});
+        let report = diagnostics(
+            "POST",
+            "/v1/responses",
+            &HeaderMap::new(),
+            Some(&body),
+            RequestKind::Responses,
+        );
+        assert_eq!(report["generate"], json!(generate.as_bool()));
+        assert!(!report.to_string().contains("PRIVATE_"));
+    }
+    let report = diagnostics(
+        "POST",
+        "/v1/responses",
+        &HeaderMap::new(),
+        Some(&json!({})),
+        RequestKind::Responses,
+    );
+    assert!(report["generate"].is_null());
+    assert!(report["body_fields"].get("generate").is_none());
+}

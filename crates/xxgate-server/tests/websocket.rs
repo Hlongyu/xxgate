@@ -61,6 +61,7 @@ async fn upstream(ws: WebSocketUpgrade, State(mock): State<Mock>) -> Response {
             let request: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(request["type"], "response.create");
             assert!(request.get("stream").is_none());
+            let prewarm = request["generate"] == false;
             let mut captures = mock.captures.lock().await;
             if captures.len() == 2 {
                 assert_eq!(request["previous_response_id"], last_response_id);
@@ -77,12 +78,14 @@ async fn upstream(ws: WebSocketUpgrade, State(mock): State<Mock>) -> Response {
                 return;
             }
             let id = format!("resp_{}", Uuid::new_v4().simple());
-            let output = json!([{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"WS answer","annotations":[]}]}]);
+            let output = if prewarm { json!([]) } else { json!([{"id":"msg_test","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"WS answer","annotations":[]}]}]) };
+            let usage = if prewarm { json!({"input_tokens":0,"output_tokens":0}) } else { json!({"input_tokens":12,"input_tokens_details":{"cached_tokens":4},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":1}}) };
             for event in [
                 json!({"type":"response.created","response":{"id":id,"model":"ws-model","status":"in_progress"}}),
                 json!({"type":"response.output_text.delta","delta":"WS answer"}),
-                json!({"type":"response.completed","response":{"id":id,"object":"response","model":"ws-model","status":"completed","output":output,"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":4},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":1}}}}),
+                json!({"type":"response.completed","response":{"id":id,"object":"response","model":"ws-model","status":"completed","output":output,"usage":usage}}),
             ] {
+                if prewarm && event["type"] == "response.output_text.delta" { continue; }
                 if socket.send(Message::Text(event.to_string().into())).await.is_err() { return; }
             }
             last_response_id = id;
@@ -302,15 +305,56 @@ async fn websocket_gateway_contract() {
 
     // Two native clients with the SAME Key and identity must not share parents.
     let mut native = connect(&base, &key).await;
-    let full = json!({"type":"response.create","model":"ws-test","input":[{"role":"user","content":"native"}],"generate":false});
+    let full = json!({"type":"response.create","model":"ws-test","input":[],"generate":false,"client_metadata":{"turn_id":"","x-codex-turn-metadata":json!({"turn_id":"","request_kind":"prewarm"}).to_string()}});
     let warmup = exchange(&mut native, full.clone()).await;
     assert_eq!(warmup["type"], "response.completed", "{warmup}");
-    let delta = json!({"type":"response.create","model":"ws-test","previous_response_id":warmup["response"]["id"],"input":[{"role":"user","content":"delta"}]});
+    assert_eq!(warmup["response"]["output"], json!([]));
+    assert_eq!(warmup["response"]["usage"]["output_tokens"], 0);
+    let delta = json!({"type":"response.create","model":"ws-test","previous_response_id":warmup["response"]["id"],"input":[{"role":"user","content":"delta"}],"client_metadata":{"turn_id":"native-turn-1","parent_turn_id":"parent-1","x-codex-turn-metadata":json!({"turn_id":"native-turn-1","parent_turn_id":"parent-1","request_kind":"turn"}).to_string()}});
     let continued = exchange(&mut native, delta.clone()).await;
     assert_eq!(continued["type"], "response.completed", "{continued}");
+    let mut next = delta.clone();
+    next["previous_response_id"] = continued["response"]["id"].clone();
+    next["client_metadata"] = json!({"turn_id":"native-turn-2","parent_turn_id":"parent-2","x-codex-turn-metadata":json!({"turn_id":"native-turn-2","parent_turn_id":"parent-2","request_kind":"turn"}).to_string()});
+    let next_response = exchange(&mut native, next).await;
+    assert_eq!(
+        next_response["type"], "response.completed",
+        "{next_response}"
+    );
     {
         let captures = mock.captures.lock().await;
         assert_eq!(captures[5]["generate"], false);
+        let turns: Vec<Value> = captures[5..8]
+            .iter()
+            .map(|r| {
+                serde_json::from_str(
+                    r["client_metadata"]["x-codex-turn-metadata"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(turns[0]["turn_id"], "");
+        assert_eq!(turns[0]["request_kind"], "prewarm");
+        for index in 1..=2 {
+            assert_eq!(
+                turns[index]["turn_id"],
+                captures[index + 5]["client_metadata"]["turn_id"]
+            );
+            assert_eq!(
+                turns[index]["parent_turn_id"],
+                captures[index + 5]["client_metadata"]["parent_turn_id"]
+            );
+            assert_eq!(turns[index]["request_kind"], "turn");
+            assert_ne!(turns[index]["turn_id"], "");
+        }
+        assert_ne!(turns[1]["turn_id"], turns[2]["turn_id"]);
+        assert_ne!(turns[1]["parent_turn_id"], turns[2]["parent_turn_id"]);
+        assert_eq!(
+            captures[7]["previous_response_id"],
+            continued["response"]["id"]
+        );
         assert_eq!(captures[6]["input"], delta["input"]);
         assert_eq!(
             captures[6]["previous_response_id"],
@@ -324,7 +368,7 @@ async fn websocket_gateway_contract() {
         stolen["response"]["error"]["code"], "previous_response_not_found",
         "{stolen}"
     );
-    assert_eq!(mock.captures.lock().await.len(), 7);
+    assert_eq!(mock.captures.lock().await.len(), 8);
     assert_eq!(
         exchange(&mut second, full.clone()).await["type"],
         "response.completed"
@@ -485,6 +529,7 @@ async fn connect(base: &str, key: &str) -> ClientSocket {
     request
         .headers_mut()
         .insert("thread-id", "native-same-thread".parse().unwrap());
+    request.headers_mut().insert("x-codex-turn-metadata", r#"{"turn_id":"handshake-turn","parent_turn_id":"handshake-parent","request_kind":"websocket_connection"}"#.parse().unwrap());
     tokio_tungstenite::client_async(request, tcp)
         .await
         .unwrap()

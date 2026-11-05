@@ -234,6 +234,8 @@ node --test crates/xxgate-server/web/tests/*.test.cjs
 
 新请求保存 `ingress_diagnostics`，包含接口路径（不含查询字符串）、方法、选定的请求关联头、请求体字节数和字段类型、收到的身份候选值、来源、最终会话/线程解析来源。身份值限制为 512 字节，每个头最多收集 4 个重复值；过长、类型/字符/编码异常仅保存原因和长度。元数据只提取枚举的身份字段，不保存任意内容。
 
+原生 WebSocket 的 `response.create` 支持 Codex 启动预热：仅当 `generate:false` 时允许 `client_metadata.turn_id` 及其嵌套投影为空字符串，向上游保留空值，不建立真实轮次映射。正式生成仍校验身份字段；每条消息从自身 `client_metadata` 读取轮次元数据，不复用握手头中的 `x-codex-turn-metadata`。同一消息内的平铺与嵌套字段仍须一致。诊断增加 `generate` 布尔值（缺失或非布尔值为 null）和 `websocket` 标记；旧记录无法据此回溯判断是否预热。
+
 入站拒绝标明鉴权、编码、读正文、JSON、身份/协议校验或入队阶段；后续失败标明派发准备、上游连接或响应处理阶段。拒绝诊断进入请求记录、`request_rejected` 审计事件及 WARN 结构化日志；下游可以按 `x-request-id` 定位，后台请求详情的「请求接入诊断」显示收到的字段、值和解析来源。持久化失败仍输出完整的受限诊断日志，避免静默丢失原因。旧请求没有采集的数据不回填。
 
 Authorization 仅记录是否存在；Cookie、Token、API Key、提示词、工具参数、图片和密文正文不进入诊断。若经 Nginx 转发下划线身份头，需要在相关 server 配置启用 `underscores_in_headers on`；两级远端 Nginx 已随 20260911-023649 版本更新，公网身份头转发及失败诊断已验证。

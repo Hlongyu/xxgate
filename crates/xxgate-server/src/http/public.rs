@@ -202,7 +202,27 @@ async fn responses_inner(
             output_observed: None,
         });
     }
-    let (parts, mut body) = request.into_parts();
+    let (mut parts, mut body) = request.into_parts();
+    let websocket = (kind == RequestKind::Responses)
+        .then(|| {
+            parts
+                .extensions
+                .get::<super::websocket::Session>()
+                .map(|s| s.0)
+                .or_else(|| {
+                    state
+                        .cluster
+                        .as_ref()
+                        .filter(|c| !c.router && c.authenticated(&parts.headers))
+                        .and_then(|_| parts.headers.get(crate::cluster::WS_HEADER))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| Uuid::parse_str(v).ok())
+                })
+        })
+        .flatten();
+    if websocket.is_some() {
+        xxgate_codex::ingress::strip_websocket_turn_header(&mut parts.headers);
+    }
     context.client_turn_state = Some(xxgate_core::turn_state::TurnStateHeader::capture(
         &parts.headers,
     ));
@@ -308,6 +328,7 @@ async fn responses_inner(
         kind,
     );
     context.diagnostics["body_bytes"] = json!(length);
+    context.diagnostics["websocket"] = json!(websocket.is_some());
     if kind == RequestKind::Responses {
         context.compaction = xxgate_codex::compaction::inspect(&parts.headers, &document)
             .ok()
@@ -334,19 +355,6 @@ async fn responses_inner(
         }
         RequestKind::Compact => xxgate_codex::compaction::parse(&parts.headers, document)?,
         RequestKind::Responses => {
-            let websocket = parts
-                .extensions
-                .get::<super::websocket::Session>()
-                .map(|s| s.0)
-                .or_else(|| {
-                    state
-                        .cluster
-                        .as_ref()
-                        .filter(|c| !c.router && c.authenticated(&parts.headers))
-                        .and_then(|_| parts.headers.get(crate::cluster::WS_HEADER))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| Uuid::parse_str(v).ok())
-                });
             if let Some(session) = websocket {
                 xxgate_codex::ingress::parse_websocket(&parts.headers, document, session)?
             } else {

@@ -369,9 +369,20 @@ pub(crate) fn normalized_headers(
         ("parent_turn_id", None),
         ("root_turn_id", None),
     ] {
-        if let Some(value) = crate::ingress::coherent(&r.identity_headers, header, &sources, field)?
-        {
-            let mapped = mapped_identity(field, &value, a, ids)?;
+        let value = if field == "turn_id" {
+            let prewarm = r.websocket_session.is_some()
+                && r.document.value.get("generate").and_then(Value::as_bool) == Some(false);
+            crate::ingress::turn_id(&sources, prewarm)?
+        } else {
+            crate::ingress::coherent(&r.identity_headers, header, &sources, field)?
+        };
+        if let Some(value) = value {
+            // Only the prewarm turn may be empty; it has no identity to map.
+            let mapped = if field == "turn_id" && value.is_empty() {
+                value
+            } else {
+                mapped_identity(field, &value, a, ids)?
+            };
             if let Some(header) = header {
                 insert_missing_header(&mut headers, header, &mapped)?;
             }

@@ -62,6 +62,7 @@ struct Mock {
     hold: Arc<AtomicBool>,
     release: Arc<Semaphore>,
     accounts: Arc<Mutex<Vec<String>>>,
+    ws_requests: Arc<Mutex<Vec<Value>>>,
 }
 async fn upstream(State(mock): State<Mock>, headers: HeaderMap, Json(_): Json<Value>) -> Response {
     mock.calls.fetch_add(1, Ordering::SeqCst);
@@ -89,6 +90,7 @@ async fn upstream_ws(
     ws.on_upgrade(move |mut socket|async move {
         while let Some(Ok(Message::Text(text)))=socket.recv().await {
             let request:Value=serde_json::from_str(&text).unwrap();assert_eq!(request["type"],"response.create");
+            mock.ws_requests.lock().await.push(request);
             mock.calls.fetch_add(1,Ordering::SeqCst);
             mock.accounts.lock().await.push(headers["chatgpt-account-id"].to_str().unwrap().into());
             let id=format!("resp_{}",Uuid::new_v4().simple());
@@ -264,6 +266,7 @@ async fn cluster_gateway_contract() {
         hold: Default::default(),
         release: Arc::new(Semaphore::new(0)),
         accounts: Default::default(),
+        ws_requests: Default::default(),
     };
     let (upstream_url, upstream_task) = serve(
         Router::new()
@@ -527,9 +530,16 @@ async fn cluster_gateway_contract() {
     request
         .headers_mut()
         .insert("session-id", "native-ws".parse().unwrap());
+    request.headers_mut().insert(
+        "x-codex-turn-metadata",
+        r#"{"turn_id":"handshake-turn","request_kind":"websocket_connection"}"#
+            .parse()
+            .unwrap(),
+    );
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    for _ in 0..2 {
-        socket.send(ClientMessage::Text(json!({"type":"response.create","model":"cluster-model","input":"PRIVATE_WS_INPUT"}).to_string().into())).await.unwrap();
+    for turn in ["", "turn-1", "turn-2"] {
+        let prewarm = turn.is_empty();
+        socket.send(ClientMessage::Text(json!({"type":"response.create","model":"cluster-model","input":"PRIVATE_WS_INPUT","generate":!prewarm,"client_metadata":{"turn_id":turn,"x-codex-turn-metadata":json!({"turn_id":turn,"request_kind":if prewarm {"prewarm"} else {"turn"}}).to_string()}}).to_string().into())).await.unwrap();
         loop {
             let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
@@ -539,7 +549,7 @@ async fn cluster_gateway_contract() {
             if let ClientMessage::Text(text) = message {
                 let event: Value = serde_json::from_str(&text).unwrap();
                 assert_ne!(event["type"], "error", "{event}");
-                assert_ne!(event["type"], "response.failed", "{event}");
+                assert_ne!(event["type"], "response.failed", "turn {turn:?}: {event}");
                 if event["type"] == "response.completed" {
                     break;
                 }
@@ -547,6 +557,33 @@ async fn cluster_gateway_contract() {
         }
     }
     socket.close(None).await.unwrap();
+    {
+        let requests = mock.ws_requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        let turns: Vec<Value> = requests
+            .iter()
+            .map(|r| {
+                serde_json::from_str(
+                    r["client_metadata"]["x-codex-turn-metadata"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(requests[0]["generate"], false);
+        assert_eq!(turns[0]["turn_id"], "");
+        assert_eq!(turns[0]["request_kind"], "prewarm");
+        for index in 1..=2 {
+            assert_eq!(
+                turns[index]["turn_id"],
+                requests[index]["client_metadata"]["turn_id"]
+            );
+            assert_eq!(turns[index]["request_kind"], "turn");
+            assert_ne!(turns[index]["turn_id"], "");
+        }
+        assert_ne!(turns[1]["turn_id"], turns[2]["turn_id"]);
+    }
     assert_eq!(mock.accounts.lock().await.last().unwrap(), "upstream-b");
     wait_for(|| sb.gateway.scheduler.stats().inflight == 0).await;
     // Node totals add up to the unfiltered cluster report, including rejections.
