@@ -27,6 +27,9 @@ use xxgate_postgres::PgStore;
 use xxgate_server::http::{AppState, router};
 use xxgate_transport::HttpTransport;
 
+#[path = "support/websocket_fallback.rs"]
+mod fallback_contract;
+
 // Transport contracts must not depend on concurrent memory use on the test host.
 // Admission and memory-pressure behavior are exercised by the memory contract.
 struct HealthyMemory;
@@ -50,10 +53,18 @@ struct Mock {
     http_requests: Arc<AtomicUsize>,
     close_after: Arc<AtomicUsize>,
     stall_next: Arc<AtomicUsize>,
+    ws_failure: Arc<AtomicUsize>,
+    handshake_status: Arc<AtomicUsize>,
+    http_status: Arc<AtomicUsize>,
+    release_failure: Arc<tokio::sync::Notify>,
+    http_captures: Arc<Mutex<Vec<(http::HeaderMap, Value)>>>,
 }
 
 async fn upstream(ws: WebSocketUpgrade, State(mock): State<Mock>) -> Response {
     mock.connections.fetch_add(1, Ordering::SeqCst);
+    if let Some(response) = fallback_contract::handshake_failure(&mock) {
+        return response;
+    }
     ws.on_upgrade(move |mut socket| async move {
         let mut last_response_id = String::new();
         while let Some(Ok(message)) = socket.recv().await {
@@ -72,6 +83,7 @@ async fn upstream(ws: WebSocketUpgrade, State(mock): State<Mock>) -> Response {
             }
             captures.push(request);
             drop(captures);
+            if fallback_contract::fail_websocket(&mock, &mut socket).await { return; }
             if mock.stall_next.swap(0, Ordering::SeqCst) == 1 {
                 socket.send(Message::Text(json!({"type":"response.created","response":{"id":"resp_stalled","status":"in_progress"}}).to_string().into())).await.unwrap();
                 while socket.recv().await.is_some() {}
@@ -155,6 +167,7 @@ async fn websocket_gateway_contract() {
                     Json(json!({"models":[{"slug":"ws-model","display_name":"WS simulation"}]}))
                 }),
             )
+            .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
             .with_state(mock.clone()),
     )
     .await;
@@ -414,6 +427,9 @@ async fn websocket_gateway_contract() {
     .await
     .expect("disconnect must release execution capacity");
 
+    fallback_contract::verify(&client, &base, &key, &gateway, &mock).await;
+    let http_requests_before = mock.http_requests.load(Ordering::SeqCst);
+
     // Account policy is persisted and controls both ingress transports.
     let detail = admin(
         &client,
@@ -457,7 +473,10 @@ async fn websocket_gateway_contract() {
         ordinary.json::<Value>().await.unwrap()["status"],
         "completed"
     );
-    assert_eq!(mock.http_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        mock.http_requests.load(Ordering::SeqCst),
+        http_requests_before + 1
+    );
 
     // List and detail retain the dispatched transport after account policy changes,
     // including successes compacted to summary-only records at Info level.
@@ -502,13 +521,22 @@ async fn websocket_gateway_contract() {
         .unwrap();
 }
 
-async fn http_upstream(State(mock): State<Mock>) -> impl IntoResponse {
+async fn http_upstream(
+    State(mock): State<Mock>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     mock.http_requests.fetch_add(1, Ordering::SeqCst);
+    mock.http_captures.lock().await.push((headers, body));
+    if let Some(response) = fallback_contract::http_failure(&mock) {
+        return response;
+    }
     let event = json!({"type":"response.completed","response":{"id":"resp_http","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}});
     (
         [("content-type", "text/event-stream")],
         format!("data: {event}\n\n"),
     )
+        .into_response()
 }
 
 type ClientSocket = WebSocketStream<tokio::net::TcpStream>;

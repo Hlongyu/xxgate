@@ -107,7 +107,7 @@ impl RequestStore for PgStore {
         }
         let mut tx = self.pool.begin().await.map_err(|_| Error::storage())?;
         // Update only diagnostics; never recalculate usage or bill a second time.
-        let rows = sqlx::query("UPDATE requests SET data = ((data - 'ingress_diagnostics' - 'client_turn_state') #- '{usage,raw_usage}') || '{\"detail_level\":\"summary\"}'::jsonb WHERE id=$1 AND state='completed' AND finished_at IS NOT NULL AND COALESCE(data->>'detail_level','full')<>'summary' AND NOT EXISTS (SELECT 1 FROM audit_events WHERE request_id=$1 AND kind IN ('delivery_interrupted','encrypted_reasoning_recovery'))")
+        let rows = sqlx::query("UPDATE requests SET data = ((data - 'ingress_diagnostics' - 'client_turn_state') #- '{usage,raw_usage}') || '{\"detail_level\":\"summary\"}'::jsonb WHERE id=$1 AND state='completed' AND finished_at IS NOT NULL AND COALESCE(data->>'detail_level','full')<>'summary' AND NOT EXISTS (SELECT 1 FROM audit_events WHERE request_id=$1 AND kind IN ('delivery_interrupted','encrypted_reasoning_recovery','websocket_http_fallback'))")
             .bind(r.id).execute(&mut *tx).await.map_err(|_| Error::storage())?.rows_affected();
         if rows > 0 {
             sqlx::query("DELETE FROM audit_events WHERE request_id=$1 AND actor='gateway' AND kind IN ('request_rewritten','dispatched','upstream_attempt_headers')")

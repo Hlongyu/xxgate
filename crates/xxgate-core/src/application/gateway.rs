@@ -79,6 +79,30 @@ struct Execution {
     safety_rejection: Option<Error>,
 }
 
+fn http_fallback_eligible(request: &GatewayRequest, record: &RequestRecord) -> bool {
+    request.kind == RequestKind::Responses
+        && request.websocket_session.is_none()
+        && record.upstream_transport == Some(UpstreamTransportKind::Websocket)
+        && record.upstream_attempts == 1
+        && record.first_event_ms.is_none()
+}
+
+fn websocket_transport_failure(error: &Error) -> bool {
+    matches!(
+        error.code.as_str(),
+        "websocket_transport_failed"
+            | "invalid_websocket_handshake"
+            | "websocket_capacity_exhausted"
+            | "connect_failed"
+            | "connect_timeout"
+            | "transport_failed"
+            | "upstream_timeout"
+            | "upstream_headers_timeout"
+            | "upstream_idle_timeout"
+            | "stream_interrupted"
+    )
+}
+
 impl Gateway {
     pub async fn new(
         store: Arc<dyn Store>,
@@ -513,7 +537,10 @@ impl Gateway {
         let started = Instant::now();
         let mut cfg = self.settings.subscribe();
         let mut sent_attempts = 0;
+        let mut transport = e.record.upstream_transport.expect("selected transport");
         'attempt: loop {
+            // A planned retry is not an upstream attempt until dispatch checks pass.
+            e.record.upstream_attempts = sent_attempts;
             if cancel.is_cancelled() || tx.is_closed() {
                 return Err(Error::cancelled());
             }
@@ -522,7 +549,7 @@ impl Gateway {
                 return Err(error);
             }
             // Shared Key policy is checked at the dispatch boundary, including
-            // queued requests and the one explicitly permitted recovery attempt.
+            // queued requests and the single shared recovery/fallback attempt.
             let key_check = async {
                 let current_key = self
                     .store
@@ -551,6 +578,11 @@ impl Gateway {
                 return Err(error);
             }
             sent_attempts += 1;
+            e.record.upstream_attempts = sent_attempts;
+            e.record.upstream_transport = Some(transport);
+            if sent_attempts > 1 {
+                self.store.update_request(&e.record).await?;
+            }
             let attempt_started = Instant::now();
             let connection = (e.record.upstream_transport
                 == Some(UpstreamTransportKind::Websocket))
@@ -567,14 +599,28 @@ impl Gateway {
                 self.transport
                     .send_response(prepared.clone(), connection, cancel.clone());
             tokio::pin!(sending);
-            let mut response = loop {
+            let response = loop {
                 let snapshot = cfg.borrow_and_update().clone();
                 self.note_config(e, snapshot.version);
                 tokio::select! {
                     biased;
-                    r = &mut sending => break r?,
+                    r = &mut sending => break r,
                     _ = cfg.changed() => {},
-                    _ = tokio::time::sleep_until(attempt_started + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => return Err(Error::new(504,"upstream_headers_timeout","Upstream response headers timed out")),
+                    _ = tokio::time::sleep_until(attempt_started + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => break Err(Error::new(504,"upstream_headers_timeout","Upstream response headers timed out")),
+                }
+            };
+            let mut response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    if http_fallback_eligible(request, &e.record)
+                        && websocket_transport_failure(&error)
+                    {
+                        self.begin_http_fallback(request, model, e, &lease, &error)
+                            .await?;
+                        transport = UpstreamTransportKind::Http;
+                        continue 'attempt;
+                    }
+                    return Err(error);
                 }
             };
             e.record.upstream_status = Some(response.status);
@@ -635,6 +681,18 @@ impl Gateway {
                 }
                 let (error, disable) = self.provider.http_error(response.status, &body);
                 self.observe_safety_rejection(e, &error);
+                // A WS handshake can fail while the HTTP Responses endpoint works.
+                // Authentication, quota and explicit safety rejections stay final.
+                if http_fallback_eligible(request, &e.record)
+                    && matches!(response.status, 400 | 404 | 405 | 426 | 500..=599)
+                    && disable.is_none()
+                    && error.code != "upstream_content_policy_violation"
+                {
+                    self.begin_http_fallback(request, model, e, &lease, &error)
+                        .await?;
+                    transport = UpstreamTransportKind::Http;
+                    continue 'attempt;
+                }
                 if request.kind == RequestKind::Search {
                     let mut memory = self.memory.lease();
                     memory.resize(body.len())?;
@@ -672,13 +730,16 @@ impl Gateway {
             let mut last_heartbeat = Instant::now();
             let mut last_event = Instant::now();
             let mut decode_memory = self.memory.lease();
+            // Even a control event held by encrypted recovery closes fallback.
+            // Never splice a new response into an already observed WS response.
+            let mut received_response_bytes = false;
             loop {
                 let snapshot = cfg.borrow_and_update().clone();
                 self.note_config(e, snapshot.version);
                 let next = tokio::select! {
                     biased;
                     _ = cfg.changed() => continue,
-                    _ = tokio::time::sleep_until(last_event + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => return Err(Error::new(504, "upstream_idle_timeout", "Upstream SSE idle timeout")),
+                    _ = tokio::time::sleep_until(last_event + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => Some(Err(Error::new(504, "upstream_idle_timeout", "Upstream SSE idle timeout"))),
                     _ = tokio::time::sleep_until(last_heartbeat + Duration::from_millis(snapshot.heartbeat_interval_ms)), if buffering && request.stream => {
                         self.send(tx, self.ingress.heartbeat(e.record.id), last_event, false).await?;
                         last_heartbeat = Instant::now();
@@ -686,15 +747,35 @@ impl Gateway {
                     },
                     next = response.bytes.next() => next,
                 };
-                let Some(chunk) = next else {
-                    decoder.finish()?;
-                    return Err(Error::new(
-                        502,
-                        "stream_interrupted",
-                        "Upstream closed before a terminal event",
-                    ));
+                if cancel.is_cancelled() || tx.is_closed() {
+                    return Err(Error::cancelled());
+                }
+                let chunk = match next {
+                    Some(result) => result,
+                    None => decoder.finish().and_then(|()| {
+                        Err(Error::new(
+                            502,
+                            "stream_interrupted",
+                            "Upstream closed before a terminal event",
+                        ))
+                    }),
                 };
-                let chunk = chunk?;
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if !received_response_bytes
+                            && http_fallback_eligible(request, &e.record)
+                            && websocket_transport_failure(&error)
+                        {
+                            self.begin_http_fallback(request, model, e, &lease, &error)
+                                .await?;
+                            transport = UpstreamTransportKind::Http;
+                            continue 'attempt;
+                        }
+                        return Err(error);
+                    }
+                };
+                received_response_bytes |= !chunk.is_empty();
                 decode_memory.resize(decoder.buffered_bytes() + chunk.len())?;
                 let events = decoder.push(
                     &chunk,
@@ -803,6 +884,28 @@ impl Gateway {
         }
     }
 
+    async fn begin_http_fallback(
+        &self,
+        request: &GatewayRequest,
+        model: &ModelSpec,
+        e: &mut Execution,
+        lease: &DispatchLease,
+        error: &Error,
+    ) -> Result<()> {
+        self.store
+            .append_event(&AuditEvent::new(
+                "websocket_http_fallback",
+                "gateway",
+                Some(e.record.id),
+                e.record.account_id,
+                json!({"failed_attempt":1,"retry_attempt":2,"from":"websocket","to":"http",
+                    "reason":error.code,"status":error.status,"upstream_status":e.record.upstream_status,
+                    "binding_id":e.record.binding_id,"upstream_events_observed":false}),
+            ))
+            .await?;
+        self.prepare_retry(request, model, e, lease).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn begin_recovery(
         &self,
@@ -825,6 +928,16 @@ impl Gateway {
                 "binding_id":e.record.binding_id}),
             ))
             .await?;
+        self.prepare_retry(request, model, e, lease).await
+    }
+
+    async fn prepare_retry(
+        &self,
+        request: &GatewayRequest,
+        model: &ModelSpec,
+        e: &mut Execution,
+        lease: &DispatchLease,
+    ) -> Result<()> {
         let current_model = self
             .store
             .models()
@@ -846,8 +959,7 @@ impl Gateway {
             ));
         }
         self.provider.validate(request, &current_model)?;
-        lease.begin_encrypted_reasoning_recovery()?;
-        e.record.upstream_attempts = 2;
+        lease.begin_recovery()?;
         e.record.upstream_status = None;
         e.record.upstream_headers_ms = None;
         e.record.upstream_request_id = None;

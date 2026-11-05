@@ -91,7 +91,8 @@ pub struct RequestRecord {
     pub first_content_ms: Option<u64>,
     pub total_ms: Option<u64>,
     pub upstream_status: Option<u16>,
-    /// Transport selected at dispatch, never inferred from the account later.
+    /// Latest dispatched transport; earlier attempts remain in the audit events.
+    /// Never inferred from the account's current configuration.
     /// None covers legacy records and requests with no upstream dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_transport: Option<UpstreamTransportKind>,

@@ -688,9 +688,9 @@ impl DispatchLease {
     pub fn begin_send(&self) -> Result<()> {
         self.begin_attempt(0)
     }
-    /// One additional send, only after the provider confirms a recoverable
-    /// encrypted-content rejection. Retains the original capacity lease.
-    pub(crate) fn begin_encrypted_reasoning_recovery(&self) -> Result<()> {
+    /// One additional send shared by encrypted-content recovery and transport
+    /// fallback. Retains the original capacity lease and rechecks eligibility.
+    pub(crate) fn begin_recovery(&self) -> Result<()> {
         self.begin_attempt(1)
     }
     fn begin_attempt(&self, previous_attempts: u8) -> Result<()> {
@@ -1772,35 +1772,32 @@ mod tests {
             .await
             .unwrap();
         lease.confirm_binding();
-        assert!(lease.begin_encrypted_reasoning_recovery().is_err());
+        assert!(lease.begin_recovery().is_err());
         lease.begin_send().unwrap();
         a.enabled = false;
         s.update_account(a.clone());
         assert_eq!(
-            lease.begin_encrypted_reasoning_recovery().unwrap_err().code,
+            lease.begin_recovery().unwrap_err().code,
             "reservation_invalidated"
         );
         a.enabled = true;
         a.group_ids.clear();
         s.update_account(a.clone());
         assert_eq!(
-            lease.begin_encrypted_reasoning_recovery().unwrap_err().code,
+            lease.begin_recovery().unwrap_err().code,
             "reservation_invalidated"
         );
         a.group_ids = vec![DEFAULT_GROUP_ID];
         s.update_account(a);
         k.enabled = false;
         s.update_key(k.clone());
-        assert_eq!(
-            lease.begin_encrypted_reasoning_recovery().unwrap_err().code,
-            "invalid_api_key"
-        );
+        assert_eq!(lease.begin_recovery().unwrap_err().code, "invalid_api_key");
         k.enabled = true;
         s.update_key(k);
-        lease.begin_encrypted_reasoning_recovery().unwrap();
+        lease.begin_recovery().unwrap();
         assert_eq!(s.stats().inflight, 1);
         assert!(lease.begin_send().is_err());
-        assert!(lease.begin_encrypted_reasoning_recovery().is_err());
+        assert!(lease.begin_recovery().is_err());
         drop(lease);
         assert_eq!(s.stats().inflight, 0);
     }

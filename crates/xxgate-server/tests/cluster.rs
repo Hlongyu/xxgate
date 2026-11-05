@@ -63,6 +63,7 @@ struct Mock {
     release: Arc<Semaphore>,
     accounts: Arc<Mutex<Vec<String>>>,
     ws_requests: Arc<Mutex<Vec<Value>>>,
+    fail_next_ws: Arc<AtomicBool>,
 }
 async fn upstream(State(mock): State<Mock>, headers: HeaderMap, Json(_): Json<Value>) -> Response {
     mock.calls.fetch_add(1, Ordering::SeqCst);
@@ -93,6 +94,7 @@ async fn upstream_ws(
             mock.ws_requests.lock().await.push(request);
             mock.calls.fetch_add(1,Ordering::SeqCst);
             mock.accounts.lock().await.push(headers["chatgpt-account-id"].to_str().unwrap().into());
+            if mock.fail_next_ws.swap(false,Ordering::SeqCst) { return; }
             let id=format!("resp_{}",Uuid::new_v4().simple());
             for event in [json!({"type":"response.created","response":{"id":id,"status":"in_progress"}}),json!({"type":"response.completed","response":{"id":id,"status":"completed","model":"cluster-model","output":[],"usage":{"input_tokens":10,"output_tokens":2}}})] {
                 if socket.send(Message::Text(event.to_string().into())).await.is_err(){return;}
@@ -267,6 +269,7 @@ async fn cluster_gateway_contract() {
         release: Arc::new(Semaphore::new(0)),
         accounts: Default::default(),
         ws_requests: Default::default(),
+        fail_next_ws: Default::default(),
     };
     let (upstream_url, upstream_task) = serve(
         Router::new()
@@ -586,6 +589,50 @@ async fn cluster_gateway_contract() {
     }
     assert_eq!(mock.accounts.lock().await.last().unwrap(), "upstream-b");
     wait_for(|| sb.gateway.scheduler.stats().inflight == 0).await;
+    // The worker falls back for HTTP ingress; entry routing and account stay fixed.
+    root.claim_session(
+        &SessionKey {
+            key_id: key.id,
+            client_session_id: "http-fallback-cluster".into(),
+        },
+        "worker-b",
+    )
+    .await
+    .unwrap();
+    let calls = mock.calls.load(Ordering::SeqCst);
+    mock.fail_next_ws.store(true, Ordering::SeqCst);
+    let fallback = response(&client, &base, secret, Some("http-fallback-cluster"), true).await;
+    let request_id = fallback.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        fallback
+            .text()
+            .await
+            .unwrap()
+            .contains("response.completed")
+    );
+    assert_eq!(mock.calls.load(Ordering::SeqCst), calls + 2);
+    let detail = admin(
+        &client,
+        &base,
+        &format!("/requests/{request_id}"),
+        "GET",
+        None,
+    )
+    .await;
+    assert_eq!(detail["request"]["node_id"], "worker-b");
+    assert_eq!(detail["request"]["account_id"], bb.id.to_string());
+    assert_eq!(detail["request"]["upstream_attempts"], 2);
+    assert_eq!(detail["request"]["upstream_transport"], "http");
+    assert!(
+        detail["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "websocket_http_fallback")
+    );
     // Node totals add up to the unfiltered cluster report, including rejections.
     let all = admin(&client, &base, "/dashboard", "GET", None).await;
     let mut total = 0;

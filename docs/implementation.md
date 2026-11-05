@@ -306,3 +306,13 @@ Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在
 入站诊断新增 `generate` 的布尔值及 `websocket` 标记，不保存非法 generate 的任意内容。只读查到线上 16:25:23（Asia/Shanghai）的拒绝请求 `60265eff-3531-45b8-b7fc-a10fa2220183`，空 turn_id 已确认，但旧日志未采集 generate，无法确认其是否为预热。
 
 验证：157 项 Rust 测试全部通过（临时 PostgreSQL、真实 HTTP/WS、双工作节点及分片链路），覆盖空 ID 预热后连续两轮生成、原连接与 previous_response_id 复用、每轮平铺/嵌套元数据一致、正式请求及非法值拒绝。Clippy 全目标禁止警告、格式和 diff 检查通过。初轮测试受本机系统代理影响，模拟上游返回 Connection 头缺少 upgrade；显式设置 `NO_PROXY=127.0.0.1,localhost` 后全套通过，未修改系统代理或生产配置。测试日志位于 `/tmp/xxgate-ws-prewarm-tests-direct.log`，未部署线上。
+
+## HTTP→WS 失败后回退 HTTP（2026-11-05，本地实现）
+
+线上会话的 HTTP 请求正文由约 9.27 MB 增至 18.15 MB 后，在上游 WS 首事件前持续断连。按用户要求，为 HTTP 入站 Responses 增加首次 WS 尝试失败后的单次 HTTP 回退：连接、发送、断流、等待超时，以及 WS 握手 400/404/405/426/5xx 或错误升级可以触发。原生 WS、已经收到响应事件（包括被暂存的控制事件）、客户端取消、明确的响应格式/大小错误、授权/额度/内容策略拒绝不回退；无会话请求也遵守内容策略拒绝。
+
+回退由核心用例执行，传输模块仍单次发送。保留原始完整 PreparedRequest，避免将 WS 自动增量的片段或 previous_response_id 送入 HTTP；沿用账户、绑定、凭证、价格、容量和线程许可。与密文恢复共用一次补发额度，总计最多两次；补发前重查模型、账户、Key，并在实际派发后更新尝试数和最近一次上游协议。WS 在首事件前断开仍可能已经开始计算，不能保证第一次未执行或未计费。
+
+新增 websocket_http_fallback 审计，保留失败原因、协议变化与绑定；成功回退不精简诊断，后台时间线显示回退动作。无需数据库迁移，不改变账户协议开关或线上配置。
+
+验证：157 项 Rust 测试及 27 项前端测试通过，Clippy 全目标禁止警告、格式和 diff 检查通过。真实 HTTP/WS/PostgreSQL 用例覆盖 18 MiB 请求回退、流式/非流式、WS 增量失败后完整历史恢复、握手拒绝和错误升级、静默超时、控制事件/输出/业务错误后不回退、原生 WS 不回退、密文恢复与回退合计最多两次、Key 撤销、真实 TCP 取消，以及双节点集群中固定工作节点和账户的回退。初轮合成上游的 HTTP JSON 默认 2 MiB 限制阻挡了 18 MiB 验证，调整测试上游限制后完成；大 WS 帧可能在发送阶段失败，审计检查兼容尚未收到首次响应头的情况。日志位于 `/tmp/xxgate-ws-http-fallback-tests.log`、`/tmp/xxgate-ws-http-fallback-web.log` 和 `/tmp/xxgate-ws-http-fallback-clippy.log`。未提交、未部署。
