@@ -402,7 +402,17 @@ impl HttpTransport {
                     .current()
                     .responses_websocket_incremental_enabled,
         )?;
-        let payload = serde_json::to_string(&payload)
+        let capacity = if plan.skipped_items == 0 {
+            request.body.len()
+        } else {
+            1024
+        };
+        let mut encoded = Vec::with_capacity(capacity.saturating_add(1024));
+        serde_json::to_writer(&mut encoded, &payload)
+            .map_err(|_| Error::invalid("Invalid Responses payload"))?;
+        drop(payload);
+        drop(request);
+        let payload = String::from_utf8(encoded.into_boxed_slice().into_vec())
             .map_err(|_| Error::invalid("Invalid Responses payload"))?;
         let payload_bytes = payload.len();
         // From this point onwards, every error is returned without fallback/retry.

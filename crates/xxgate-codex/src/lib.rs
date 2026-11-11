@@ -12,3 +12,5 @@ pub const CODEX_VERSION: &str = "0.153.4";
 pub const CODEX_COMMIT: &str = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a";
 
 pub mod model_version;
+
+pub mod routing;

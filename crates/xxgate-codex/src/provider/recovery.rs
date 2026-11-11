@@ -56,20 +56,58 @@ fn tool_output(item: &Value) -> bool {
 }
 
 pub(super) fn has_recoverable_input(request: &PreparedRequest) -> bool {
-    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+    use serde::Deserialize;
+    use serde_json::value::RawValue;
+    use std::borrow::Cow;
+    #[derive(Deserialize)]
+    struct Envelope<'a> {
+        #[serde(borrow)]
+        input: Option<&'a RawValue>,
+    }
+    fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+        serde::de::IgnoredAny::deserialize(d).map(|_| true)
+    }
+    #[derive(Deserialize)]
+    struct Item<'a> {
+        #[serde(rename = "type")]
+        kind: Option<Cow<'a, str>>,
+        #[serde(default, deserialize_with = "present")]
+        encrypted_content: bool,
+        #[serde(borrow)]
+        output: Option<&'a RawValue>,
+    }
+    #[derive(Deserialize)]
+    struct Part<'a> {
+        #[serde(rename = "type")]
+        kind: Option<Cow<'a, str>>,
+    }
+    let has = |raw: &RawValue| {
+        let Ok(item) = serde_json::from_str::<Item<'_>>(raw.get()) else {
+            return false;
+        };
+        match item.kind.as_deref() {
+            Some("reasoning") => item.encrypted_content,
+            Some("function_call_output" | "custom_tool_call_output") => item
+                .output
+                .and_then(|v| serde_json::from_str::<Vec<&RawValue>>(v.get()).ok())
+                .is_some_and(|parts| {
+                    parts.iter().any(|p| {
+                        serde_json::from_str::<Part<'_>>(p.get())
+                            .is_ok_and(|p| p.kind.as_deref() == Some("encrypted_content"))
+                    })
+                }),
+            _ => false,
+        }
+    };
+    let Ok(Envelope { input: Some(input) }) = serde_json::from_slice::<Envelope<'_>>(&request.body)
+    else {
         return false;
     };
-    let has = |item: &Value| {
-        (item["type"] == "reasoning" && item.get("encrypted_content").is_some())
-            || (tool_output(item)
-                && item["output"]
-                    .as_array()
-                    .is_some_and(|parts| parts.iter().any(|p| p["type"] == "encrypted_content")))
-    };
-    match body.get("input") {
-        Some(Value::Array(items)) => items.iter().any(has),
-        Some(item @ Value::Object(_)) => has(item),
-        _ => false,
+    if input.get().starts_with('[') {
+        serde_json::from_str::<Vec<&RawValue>>(input.get())
+            .is_ok_and(|items| items.into_iter().any(has))
+    } else {
+        has(input)
     }
 }
 

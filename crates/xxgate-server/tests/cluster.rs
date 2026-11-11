@@ -64,8 +64,21 @@ struct Mock {
     accounts: Arc<Mutex<Vec<String>>>,
     ws_requests: Arc<Mutex<Vec<Value>>>,
     fail_next_ws: Arc<AtomicBool>,
+    large_body_verified: Arc<AtomicBool>,
 }
-async fn upstream(State(mock): State<Mock>, headers: HeaderMap, Json(_): Json<Value>) -> Response {
+async fn upstream(
+    State(mock): State<Mock>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if body["instructions"] == "large-body-preservation" {
+        assert_eq!(body["input"][0]["content"], "large-input-".repeat(65536));
+        assert_eq!(
+            body["tools"][0]["parameters"]["description"],
+            "large-schema-".repeat(16384)
+        );
+        mock.large_body_verified.store(true, Ordering::SeqCst);
+    }
     mock.calls.fetch_add(1, Ordering::SeqCst);
     mock.accounts.lock().await.push(
         headers
@@ -270,6 +283,7 @@ async fn cluster_gateway_contract() {
         accounts: Default::default(),
         ws_requests: Default::default(),
         fail_next_ws: Default::default(),
+        large_body_verified: Default::default(),
     };
     let (upstream_url, upstream_task) = serve(
         Router::new()
@@ -346,6 +360,14 @@ async fn cluster_gateway_contract() {
     )
     .await;
     assert_eq!(detail["request"]["node_id"], node);
+    let large = client.post(format!("{base}/v1/responses")).bearer_auth(secret)
+        .header("session-id", "large-payload")
+        .json(&json!({"model":"cluster-model","input":[{"role":"user","content":"large-input-".repeat(65536)}],
+            "instructions":"large-body-preservation","tools":[{"type":"function","name":"test","parameters":{"description":"large-schema-".repeat(16384)}}]}))
+        .send().await.unwrap();
+    assert_eq!(large.status(), 200);
+    assert_eq!(large.json::<Value>().await.unwrap()["status"], "completed");
+    assert!(mock.large_body_verified.load(Ordering::SeqCst));
     // One placement winner for simultaneous first arrivals across routers/workers.
     let session = SessionKey {
         key_id: key.id,

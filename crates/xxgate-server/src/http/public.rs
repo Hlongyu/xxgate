@@ -309,16 +309,21 @@ async fn responses_inner(
         .check(true)
         .map_err(|rejection| memory_rejection(state, context, *rejection))?;
     let parser = state.gateway.memory_admission.parser().await;
-    let document: Value = xxgate_core::memory_json::parse(&raw, &state.gateway.memory_admission)
-        .map_err(|error| match error {
-            xxgate_core::memory_json::ParseError::Memory(rejection) => {
-                memory_rejection(state, context, *rejection)
-            }
-            xxgate_core::memory_json::ParseError::Invalid => {
-                context.diagnostics["body_status"] = json!("invalid_json");
-                Error::invalid("The body must contain valid JSON")
-            }
-        })?;
+    let document =
+        if kind == RequestKind::Responses && state.cluster.as_ref().is_some_and(|c| c.router) {
+            xxgate_codex::routing::projection(&raw, &state.gateway.memory_admission)
+        } else {
+            xxgate_core::memory_json::parse(&raw, &state.gateway.memory_admission)
+        };
+    let document: Value = document.map_err(|error| match error {
+        xxgate_core::memory_json::ParseError::Memory(rejection) => {
+            memory_rejection(state, context, *rejection)
+        }
+        xxgate_core::memory_json::ParseError::Invalid => {
+            context.diagnostics["body_status"] = json!("invalid_json");
+            Error::invalid("The body must contain valid JSON")
+        }
+    })?;
     drop(parser);
     context.diagnostics = xxgate_codex::identity_input::diagnostics(
         parts.method.as_str(),

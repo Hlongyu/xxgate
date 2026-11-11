@@ -142,6 +142,55 @@ fn push(
     });
 }
 
+/// Bounded identifier-only snapshot, so moving the actual input never requires
+/// retaining conversation contents merely for rewrite diagnostics.
+#[derive(Default)]
+pub(crate) struct InputIdentifiers {
+    entries: Vec<(usize, &'static str, String)>,
+    omitted: usize,
+}
+pub(crate) fn input_identifiers(source: &Value) -> InputIdentifiers {
+    let mut result = InputIdentifiers::default();
+    if let Some(items) = source.get("input").and_then(Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            for field in ["id", "call_id"] {
+                if let Some(value) = item.get(field).and_then(Value::as_str) {
+                    if result.entries.len() >= MAX_ENTRIES || identifier(value).is_none() {
+                        result.omitted += 1;
+                    } else {
+                        result.entries.push((index, field, value.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+pub(crate) fn compare_input_identifiers(
+    incoming: &BTreeMap<String, String>,
+    input: &InputIdentifiers,
+    headers: &HeaderMap,
+    body: &Value,
+) -> RequestRewrite {
+    let mut trace = compare(incoming, &Value::Null, headers, body);
+    trace.omitted += input.omitted;
+    for (index, field, before) in &input.entries {
+        let after = body
+            .get("input")
+            .and_then(|v| v.get(*index))
+            .and_then(|v| v.get(*field))
+            .and_then(Value::as_str);
+        push(
+            &mut trace,
+            format!("body.input[{index}].{field}"),
+            Some(before),
+            after,
+            true,
+        );
+    }
+    trace
+}
+
 pub(crate) fn compare(
     incoming: &BTreeMap<String, String>,
     source: &Value,

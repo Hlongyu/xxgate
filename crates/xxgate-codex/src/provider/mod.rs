@@ -121,6 +121,25 @@ impl ProviderAdapter for CodexProvider {
             request::prepare(r, m, a, c, ids)
         }
     }
+    fn prepare_consuming(
+        &self,
+        r: &mut GatewayRequest,
+        m: &ModelSpec,
+        a: &Account,
+        c: &Credentials,
+        ids: &mut IdentityMap,
+        body_bytes: usize,
+    ) -> Result<PreparedRequest> {
+        if matches!(
+            r.kind,
+            xxgate_core::protocol::RequestKind::Responses
+                | xxgate_core::protocol::RequestKind::Compact
+        ) {
+            request::prepare_consuming(r, m, a, c, ids, body_bytes)
+        } else {
+            self.prepare(r, m, a, c, ids)
+        }
+    }
     fn decoder(&self) -> Box<dyn ProviderDecoder> {
         Box::new(events::CodexDecoder::default())
     }

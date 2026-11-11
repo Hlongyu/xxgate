@@ -182,6 +182,19 @@ pub trait ProviderAdapter: Send + Sync {
         credentials: &Credentials,
         ids: &mut IdentityMap,
     ) -> Result<PreparedRequest>;
+    /// Called only after the dispatch lease is committed. Providers may move
+    /// payload fields and retain only the facts required to validate a retry.
+    fn prepare_consuming(
+        &self,
+        request: &mut GatewayRequest,
+        model: &ModelSpec,
+        account: &Account,
+        credentials: &Credentials,
+        ids: &mut IdentityMap,
+        _body_bytes: usize,
+    ) -> Result<PreparedRequest> {
+        self.prepare(request, model, account, credentials, ids)
+    }
     fn decoder(&self) -> Box<dyn ProviderDecoder>;
     fn image_response(&self, body: &[u8]) -> Result<Usage>;
     fn search_response(&self, body: &[u8]) -> Result<Usage>;

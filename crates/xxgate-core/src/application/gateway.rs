@@ -273,13 +273,14 @@ impl Gateway {
         let stream = request.stream;
         self.tasks.spawn(async move {
             let _memory = memory;
+            let mut request = request;
             let cancel = this.shutdown.child_token();
             let mut execution = Execution { response_headers: http::HeaderMap::new(), ticket: Some(ticket), record, price: None, finalized: false, terminal_delivered: false, unary: None, raw_body: None, safety_rejection: None };
             let result = tokio::select! {
                 biased;
                 _ = tx.closed() => { cancel.cancel(); Err(Error::cancelled()) },
                 _ = cancel.cancelled() => Err(Error::new(503, "gateway_shutdown", "The gateway is shutting down")),
-                result = this.execute(&request, &model, &mut execution, &tx, &cancel, since) => result,
+                result = this.execute(&mut request, &model, &mut execution, &tx, &cancel, since) => result,
             };
             cancel.cancel();
             let error = result.err();
@@ -402,7 +403,7 @@ impl Gateway {
 
     async fn execute(
         &self,
-        request: &GatewayRequest,
+        request: &mut GatewayRequest,
         model: &ModelSpec,
         e: &mut Execution,
         tx: &mpsc::Sender<Bytes>,
@@ -486,13 +487,6 @@ impl Gateway {
             e.record.binding_id = (!request.stateless).then_some(lease.binding.id);
             e.record.binding_generation = (!request.stateless).then_some(lease.binding.generation);
             e.record.queue_ms = Some(since.elapsed().as_millis() as u64);
-            let prepared =
-                self.provider
-                    .prepare(request, &current_model, &account, &credentials, &mut ids)?;
-            let pending = ids.take_pending();
-            if !request.stateless {
-                self.store.save_mappings(ids.binding.id, &pending).await?;
-            }
             if request.kind == RequestKind::Search {
                 e.record.search_price = Some(self.store.search_price().await?);
             } else {
@@ -505,6 +499,18 @@ impl Gateway {
             }
             match lease.begin_send() {
                 Ok(()) => {
+                    let prepared = self.provider.prepare_consuming(
+                        request,
+                        &current_model,
+                        &account,
+                        &credentials,
+                        &mut ids,
+                        e.record.body_bytes,
+                    )?;
+                    let pending = ids.take_pending();
+                    if !request.stateless {
+                        self.store.save_mappings(ids.binding.id, &pending).await?;
+                    }
                     let rewrite = ids.take_request_rewrite();
                     break (lease, ids, prepared, rewrite);
                 }
@@ -595,18 +601,20 @@ impl Gateway {
                 },
                 binding_id: lease.binding.id,
             });
-            let sending =
-                self.transport
-                    .send_response(prepared.clone(), connection, cancel.clone());
-            tokio::pin!(sending);
-            let response = loop {
-                let snapshot = cfg.borrow_and_update().clone();
-                self.note_config(e, snapshot.version);
-                tokio::select! {
-                    biased;
-                    r = &mut sending => break r,
-                    _ = cfg.changed() => {},
-                    _ = tokio::time::sleep_until(attempt_started + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => break Err(Error::new(504,"upstream_headers_timeout","Upstream response headers timed out")),
+            let response = {
+                let sending =
+                    self.transport
+                        .send_response(prepared.clone(), connection, cancel.clone());
+                tokio::pin!(sending);
+                loop {
+                    let snapshot = cfg.borrow_and_update().clone();
+                    self.note_config(e, snapshot.version);
+                    tokio::select! {
+                        biased;
+                        r = &mut sending => break r,
+                        _ = cfg.changed() => {},
+                        _ = tokio::time::sleep_until(attempt_started + Duration::from_millis(snapshot.sse_idle_timeout_ms)) => break Err(Error::new(504,"upstream_headers_timeout","Upstream response headers timed out")),
+                    }
                 }
             };
             let mut response = match response {
@@ -718,12 +726,16 @@ impl Gateway {
             if matches!(request.kind, RequestKind::Search | RequestKind::Compact)
                 || request.kind.is_image()
             {
+                prepared.body = Bytes::new();
                 return self.receive_unary(response.bytes, e, since, started).await;
             }
             let mut decoder = self.provider.decoder();
             let mut buffering = request.websocket_session.is_none()
                 && e.record.upstream_attempts == 1
                 && self.provider.has_recoverable_encrypted_input(&prepared);
+            if !buffering && !http_fallback_eligible(request, &e.record) {
+                prepared.body = Bytes::new();
+            }
             let mut preamble = Vec::new();
             let mut preamble_bytes = 0usize;
             let mut preamble_memory = self.memory.lease();
@@ -878,6 +890,9 @@ impl Gateway {
                         self.send(tx, self.ingress.encode(&event.document)?, last_event, false)
                             .await?;
                     }
+                }
+                if received_response_bytes && !buffering {
+                    prepared.body = Bytes::new();
                 }
                 decode_memory.resize(decoder.buffered_bytes())?;
             }

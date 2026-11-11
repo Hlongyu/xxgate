@@ -98,7 +98,62 @@ pub(crate) fn prepare(
     c: &Credentials,
     ids: &mut IdentityMap,
 ) -> Result<PreparedRequest> {
-    let source = &r.document.value;
+    prepare_source(r, m, a, c, ids, r.document.value.clone(), 0)
+}
+
+pub(crate) fn prepare_consuming(
+    r: &mut GatewayRequest,
+    m: &ModelSpec,
+    a: &Account,
+    c: &Credentials,
+    ids: &mut IdentityMap,
+    body_bytes: usize,
+) -> Result<PreparedRequest> {
+    let source = r.document.value.take();
+    // Retry validation must still detect capability changes without retaining
+    // conversation contents or large tool schemas through the response stream.
+    r.document.value = retry_validation(&source);
+    prepare_source(r, m, a, c, ids, source, body_bytes)
+}
+
+fn retry_validation(source: &Value) -> Value {
+    let mut facts = serde_json::Map::new();
+    if source.get("reasoning").is_some_and(|v| !v.is_null()) {
+        facts.insert("reasoning".into(), json!({}));
+    }
+    if let Some(tools) = source.get("tools").and_then(Value::as_array) {
+        let mut selected = Vec::new();
+        if !tools.is_empty() {
+            selected.push(json!({"type":"function"}));
+        }
+        if tools.iter().any(|t| t["type"] == "image_generation") {
+            selected.push(json!({"type":"image_generation"}));
+        }
+        facts.insert("tools".into(), Value::Array(selected));
+    }
+    if has_image(&source["input"]) {
+        facts.insert("input".into(), json!([{"type":"input_image"}]));
+    }
+    Value::Object(facts)
+}
+
+fn prepare_source(
+    r: &GatewayRequest,
+    m: &ModelSpec,
+    a: &Account,
+    c: &Credentials,
+    ids: &mut IdentityMap,
+    mut source: Value,
+    body_bytes: usize,
+) -> Result<PreparedRequest> {
+    let (mut headers, client_meta) = normalized_headers_source(r, a, c, ids, &source)?;
+    let trace_input = crate::identity_trace::input_identifiers(&source);
+    let cache = source
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let mut body = serde_json::Map::new();
     // Codex OAuth rejects max_output_tokens even though the public Responses
     // API accepts it. Accept it at ingress for compatibility, but omit it here;
@@ -118,21 +173,23 @@ pub(crate) fn prepare(
         "truncation",
         "access_programs",
     ] {
-        if let Some(value) = source.get(key) {
-            body.insert(key.into(), value.clone());
+        if let Some(value) = source.as_object_mut().and_then(|s| s.remove(key)) {
+            body.insert(key.into(), value);
         }
     }
     if r.websocket_session.is_some() {
         for key in ["previous_response_id", "generate"] {
-            if let Some(value) = source.get(key) {
-                body.insert(key.into(), value.clone());
+            if let Some(value) = source.as_object_mut().and_then(|s| s.remove(key)) {
+                body.insert(key.into(), value);
             }
         }
     }
+    drop(source);
     // The Codex transport requires a message array and an instructions field,
     // even for ordinary Responses callers that do not provide Codex metadata.
     if let Some(input) = body.get_mut("input") {
-        if let Some(text) = input.as_str() {
+        if input.is_string() {
+            let text = input.take();
             *input = json!([{"role":"user","content":text}]);
         }
         if let Some(items) = input.as_array_mut() {
@@ -156,19 +213,13 @@ pub(crate) fn prepare(
     if let Some(tier) = r.requested_tier.as_deref().filter(|v| *v != "auto") {
         body.insert("service_tier".into(), json!(tier));
     }
-    let (mut headers, client_meta) = normalized_headers(r, a, c, ids)?;
     if r.kind == RequestKind::Compact {
         headers.insert("accept", HeaderValue::from_static("application/json"));
     }
     if let Some(client_meta) = client_meta {
         body.insert("client_metadata".into(), client_meta);
     }
-    if let Some(cache) = source
-        .get("prompt_cache_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(cache) = cache.as_deref() {
         // Cache partitions are independent of session tracing. Preserve existing
         // Codex session-key mappings; otherwise scope a stable key by gateway Key
         // and account without creating a session or changing it on every request.
@@ -193,12 +244,15 @@ pub(crate) fn prepare(
         body.insert("prompt_cache_key".into(), json!(mapped));
     }
     let body = Value::Object(body);
-    ids.record_request_rewrite(crate::identity_trace::compare(
+    ids.record_request_rewrite(crate::identity_trace::compare_input_identifiers(
         &r.identifier_inputs,
-        source,
+        &trace_input,
         &headers,
         &body,
     ));
+    let mut encoded = Vec::with_capacity(body_bytes.saturating_add(1024));
+    serde_json::to_writer(&mut encoded, &body)
+        .map_err(|_| Error::invalid("Invalid request body"))?;
     Ok(PreparedRequest {
         method: Method::POST,
         url: format!(
@@ -211,9 +265,7 @@ pub(crate) fn prepare(
             }
         ),
         headers,
-        body: Bytes::from(
-            serde_json::to_vec(&body).map_err(|_| Error::invalid("Invalid request body"))?,
-        ),
+        body: Bytes::from(encoded.into_boxed_slice()),
         account_id: Some(a.id),
         profile_version: a.version,
         tls_backend: a.profile.tls_backend.clone(),
@@ -286,6 +338,16 @@ pub(crate) fn normalized_headers(
     c: &Credentials,
     ids: &mut IdentityMap,
 ) -> Result<(HeaderMap, Option<Value>)> {
+    normalized_headers_source(r, a, c, ids, &r.document.value)
+}
+
+fn normalized_headers_source(
+    r: &GatewayRequest,
+    a: &Account,
+    c: &Credentials,
+    ids: &mut IdentityMap,
+    source: &Value,
+) -> Result<(HeaderMap, Option<Value>)> {
     let mut headers = auth_headers(a, c)?;
     headers.insert("content-type", HeaderValue::from_static("application/json"));
     headers.insert("accept", HeaderValue::from_static("text/event-stream"));
@@ -329,11 +391,7 @@ pub(crate) fn normalized_headers(
         );
     }
     let metadata = if r.client_metadata_present {
-        Some(normalized_metadata(
-            &r.document.value["client_metadata"],
-            a,
-            ids,
-        )?)
+        Some(normalized_metadata(&source["client_metadata"], a, ids)?)
     } else {
         None
     };
@@ -347,7 +405,7 @@ pub(crate) fn normalized_headers(
 
     // Reuse the same validated sources and mappings as the body. Only project
     // known identity fields; arbitrary client metadata must not become headers.
-    let sources = crate::ingress::metadata(&r.document.value, &r.identity_headers)?;
+    let sources = crate::ingress::metadata(source, &r.identity_headers)?;
     let mut turn = serde_json::Map::new();
     if !r.stateless {
         turn.insert(
@@ -371,7 +429,7 @@ pub(crate) fn normalized_headers(
     ] {
         let value = if field == "turn_id" {
             let prewarm = r.websocket_session.is_some()
-                && r.document.value.get("generate").and_then(Value::as_bool) == Some(false);
+                && source.get("generate").and_then(Value::as_bool) == Some(false);
             crate::ingress::turn_id(&sources, prewarm)?
         } else {
             crate::ingress::coherent(&r.identity_headers, header, &sources, field)?
@@ -434,4 +492,79 @@ fn insert_missing_header(headers: &mut HeaderMap, name: &'static str, value: &st
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use xxgate_core::{
+        identity::{Binding, SessionKey},
+        protocol::IngressAdapter,
+        types::ModelRef,
+    };
+
+    fn fixture() -> (Account, Credentials, ModelSpec, IdentityMap) {
+        let id = Uuid::new_v4();
+        let a:Account=serde_json::from_value(json!({"id":id,"name":"test","provider":"openai","access_kind":"codex_oauth","enabled":true,"disable_reason":null,"max_inflight":1,"upstream_account_id":"test","upstream_base_url":"https://example.invalid","models":[],"profile":{"installation_id":Uuid::new_v4(),"codex_version":"test","user_agent":"test","tls_backend":"rustls"},"version":1,"credential_version":1,"credential_expires_at":null,"created_at":"2026-11-09T00:00:00Z","updated_at":"2026-11-09T00:00:00Z"})).unwrap();
+        let c = serde_json::from_value(
+            json!({"access_token":"synthetic","refresh_token":"","expires_at":null}),
+        )
+        .unwrap();
+        let m=serde_json::from_value(json!({"id":"test","upstream":{"provider":"openai","access_kind":"codex_oauth","model":"test"},"enabled":true,"capabilities":{},"version":1})).unwrap();
+        let ids = IdentityMap::new(
+            Binding::new(
+                SessionKey {
+                    key_id: Uuid::new_v4(),
+                    client_session_id: "s".into(),
+                },
+                id,
+                &ModelRef::codex("test"),
+                1,
+            ),
+            vec![],
+        );
+        (a, c, m, ids)
+    }
+
+    #[test]
+    fn consuming_prepare_preserves_wire_and_retry_requirements_without_retaining_payload() {
+        let (a, c, m, mut ids) = fixture();
+        let body = json!({"model":"test","input":[{"role":"user","content":[{"type":"input_text","text":"PRIVATE_TEXT".repeat(10000)},{"type":"input_image","image_url":"PRIVATE_IMAGE".repeat(10000)}]}],
+            "instructions":"PRIVATE_INSTRUCTIONS".repeat(1000),"tools":[{"type":"image_generation"},{"type":"function","name":"f","parameters":{"description":"PRIVATE_SCHEMA".repeat(10000)}}],"reasoning":{"effort":"high"},"service_tier":"fast"});
+        let bytes = serde_json::to_vec(&body).unwrap().len();
+        let mut r = crate::ingress::ResponsesIngress
+            .parse(&HeaderMap::new(), body)
+            .unwrap();
+        validate(&r, &m).unwrap();
+        let expected = prepare(&r, &m, &a, &c, &mut ids).unwrap();
+        let actual = prepare_consuming(&mut r, &m, &a, &c, &mut ids, bytes).unwrap();
+        assert_eq!(actual.body, expected.body);
+        assert_eq!(actual.headers, expected.headers);
+        assert!(r.document.value.to_string().len() < 256);
+        assert!(!r.document.value.to_string().contains("PRIVATE"));
+        for capability in ["image", "image_tool", "tools", "reasoning", "fast"] {
+            let mut changed = m.clone();
+            match capability {
+                "image" => changed.capabilities.image_input = false,
+                "image_tool" => changed.capabilities.image_generation = false,
+                "tools" => changed.capabilities.tools = false,
+                "reasoning" => changed.capabilities.reasoning = false,
+                _ => changed.capabilities.fast = false,
+            }
+            assert!(
+                validate(&r, &changed).is_err(),
+                "{capability} must still be checked during recovery"
+            );
+        }
+    }
+    #[test]
+    fn consuming_native_prewarm_keeps_empty_turn_and_generate_false() {
+        let (a, c, m, mut ids) = fixture();
+        let mut r=crate::ingress::parse_websocket(&HeaderMap::new(),json!({"type":"response.create","model":"test","generate":false,"input":"hello","client_metadata":{"turn_id":""}}),Uuid::new_v4()).unwrap();
+        let prepared = prepare_consuming(&mut r, &m, &a, &c, &mut ids, 1024).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(body["generate"], false);
+        assert_eq!(body["client_metadata"]["turn_id"], "");
+        assert_eq!(body["input"][0]["content"], "hello");
+    }
 }
