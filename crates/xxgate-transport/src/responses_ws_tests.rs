@@ -219,6 +219,54 @@ async fn reuses_socket_with_incremental_input_and_per_turn_metadata() {
 }
 
 #[tokio::test]
+async fn preserves_utf8_turn_metadata_on_new_and_reused_sockets() {
+    let server = Server::new().await;
+    let transport = HttpTransport::new(LiveSettings::new(Default::default()), true);
+    let key = key();
+    let mut expected = Vec::new();
+    for (turn, label) in [("one", "中文"), ("two", "😀")] {
+        let metadata = json!({"turn_id":turn,"tool_namespaces_info":label}).to_string();
+        let mut request = server.request();
+        request.headers.insert(
+            "x-codex-turn-metadata",
+            HeaderValue::from_str(&metadata).unwrap(),
+        );
+        run(&transport, request, key.clone()).await;
+        expected.push(metadata);
+    }
+    assert_eq!(server.handshakes(), 1);
+    let payloads = server.observed.payloads.lock().unwrap();
+    assert_eq!(payloads.len(), expected.len());
+    for (payload, metadata) in payloads.iter().zip(expected) {
+        assert_eq!(
+            payload["client_metadata"]["x-codex-turn-metadata"],
+            metadata
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejects_non_utf8_turn_metadata_before_connecting() {
+    let server = Server::new().await;
+    let transport = HttpTransport::new(LiveSettings::new(Default::default()), true);
+    let mut request = server.request();
+    request.headers.insert(
+        "x-codex-turn-metadata",
+        HeaderValue::from_bytes(b"{\"tool_namespaces_info\":\"\xff\"}").unwrap(),
+    );
+    let error = transport
+        .send_response(request, Some(key()), CancellationToken::new())
+        .await
+        .err()
+        .expect("non-UTF-8 metadata must be rejected");
+    assert_eq!(error.status, 400);
+    assert_eq!(error.code, "invalid_request");
+    assert_eq!(error.message, "Invalid turn metadata");
+    assert_eq!(server.handshakes(), 0);
+    assert_eq!(server.calls(), 0);
+}
+
+#[tokio::test]
 async fn missing_parent_is_not_retried_and_next_request_sends_full_history() {
     let server = Server::new().await;
     let transport = HttpTransport::new(LiveSettings::new(Default::default()), true);

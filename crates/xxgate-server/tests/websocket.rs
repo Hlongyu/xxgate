@@ -227,6 +227,15 @@ async fn websocket_gateway_contract() {
     let mut previous_response_id = String::new();
     let mut ws_request_ids = Vec::new();
     for (turn, stream) in [(1, true), (2, false), (3, true)] {
+        // Inbound headers contain ASCII JSON escapes. Identity rewriting decodes
+        // these to UTF-8 before the transport builds each WS create event.
+        let label = match turn {
+            1 => "ASCII",
+            2 => r"\u4e2d\u6587",
+            _ => r"\ud83d\ude00",
+        };
+        let turn_metadata =
+            format!(r#"{{"turn_id":"turn-{turn}","tool_namespaces_info":"{label}"}}"#);
         let mut input = Vec::new();
         if turn == 3 {
             input.push(json!({"role":"user","content":"PRIVATE_WS_INPUT_2"}));
@@ -235,7 +244,8 @@ async fn websocket_gateway_contract() {
         input.push(json!({"role":"user","content":format!("PRIVATE_WS_INPUT_{turn}")}));
         let response = client.post(format!("{base}/v1/responses")).bearer_auth(&key)
             .header("session-id", "ws-session").header("thread-id", "ws-thread")
-            .json(&json!({"model":"ws-test","input":input,"stream":stream,"client_metadata":{"turn_id":format!("turn-{turn}")}}))
+            .header("x-codex-turn-metadata", &turn_metadata)
+            .json(&json!({"model":"ws-test","input":input,"stream":stream,"client_metadata":{"turn_id":format!("turn-{turn}"),"x-codex-turn-metadata":turn_metadata}}))
             .send().await.unwrap();
         if response.status() != 200 {
             panic!(
@@ -297,6 +307,16 @@ async fn websocket_gateway_contract() {
         captures[0]["client_metadata"]["x-codex-turn-metadata"],
         captures[1]["client_metadata"]["x-codex-turn-metadata"]
     );
+    for (payload, label) in captures.iter().zip(["ASCII", "中文", "😀"]) {
+        let metadata: Value = serde_json::from_str(
+            payload["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["tool_namespaces_info"], label);
+        assert_eq!(metadata["turn_id"], payload["client_metadata"]["turn_id"]);
+    }
     drop(captures);
     // Stateless HTTP still uses WS, but cannot retain a conversation socket.
     for _ in 0..2 {

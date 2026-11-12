@@ -238,17 +238,15 @@ fn create_payload(request: &PreparedRequest) -> Result<Value> {
     body.remove("background");
     body.insert("type".into(), json!("response.create"));
     if let Some(turn) = request.headers.get("x-codex-turn-metadata") {
+        // Identity rewriting can decode JSON escapes into UTF-8. HeaderValue's
+        // to_str only accepts ASCII, while the WS JSON string supports UTF-8.
+        let turn = std::str::from_utf8(turn.as_bytes())
+            .map_err(|_| Error::invalid("Invalid turn metadata"))?;
         let metadata = body.entry("client_metadata").or_insert_with(|| json!({}));
         metadata
             .as_object_mut()
             .ok_or_else(|| Error::invalid("Invalid client metadata"))?
-            .insert(
-                "x-codex-turn-metadata".into(),
-                json!(
-                    turn.to_str()
-                        .map_err(|_| Error::invalid("Invalid turn metadata"))?
-                ),
-            );
+            .insert("x-codex-turn-metadata".into(), json!(turn));
     }
     Ok(value)
 }
