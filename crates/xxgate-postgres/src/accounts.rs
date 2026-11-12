@@ -82,6 +82,52 @@ impl PgStore {
         }
         Ok(connection)
     }
+
+    /// Reserve the sole standby slot before waiting for the incumbent. Holding
+    /// the migration gate also prevents DDL racing a prepared candidate.
+    pub async fn standby_lock(&self) -> Result<sqlx::PgConnection> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| Error::storage())?
+            .detach();
+        let shared: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock_shared(848847415,1)")
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|_| Error::storage())?;
+        let standby: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(848847419,hashtext($1))")
+                .bind(&self.node_id)
+                .fetch_one(&mut connection)
+                .await
+                .map_err(|_| Error::storage())?;
+        if !shared || !standby {
+            return Err(Error::new(
+                409,
+                "standby_unavailable",
+                "Another candidate or migration already owns this node's standby slot",
+            ));
+        }
+        Ok(connection)
+    }
+
+    pub async fn activate_standby(&self, connection: &mut sqlx::PgConnection) -> Result<bool> {
+        let acquired: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(848847418,hashtext($1))")
+                .bind(&self.node_id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|_| Error::storage())?;
+        if acquired {
+            sqlx::query("SELECT pg_advisory_unlock(848847419,hashtext($1))")
+                .bind(&self.node_id)
+                .execute(connection)
+                .await
+                .map_err(|_| Error::storage())?;
+        }
+        Ok(acquired)
+    }
 }
 
 pub(crate) fn decode<T: serde::de::DeserializeOwned>(row: &sqlx::postgres::PgRow) -> Result<T> {

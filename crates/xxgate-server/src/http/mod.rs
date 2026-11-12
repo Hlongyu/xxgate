@@ -29,6 +29,7 @@ use xxgate_core::{Error, application::gateway::Gateway};
 pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
+    pub deployment: Arc<crate::deployment::Deployment>,
     pub(crate) telemetry: crate::telemetry::Telemetry,
     pub allow_http: bool,
     pub secure_cookies: bool,
@@ -60,6 +61,7 @@ impl AppState {
         Self {
             gateway,
             cluster: None,
+            deployment: crate::deployment::Deployment::new(),
             telemetry: Default::default(),
             allow_http,
             secure_cookies,
@@ -180,6 +182,8 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/app.css", get(css))
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
+        .route("/internal/deployment", get(crate::deployment::status))
+        .route("/internal/deployment/handoff", post(crate::deployment::handoff).layer(DefaultBodyLimit::max(4096)))
         .route("/internal/reload", post(cluster::reload))
         .route("/internal/websocket/{id}", axum::routing::delete(cluster::close_websocket))
         .route("/api/admin/login", post(auth::login).layer(DefaultBodyLimit::max(4096)))
@@ -206,6 +210,7 @@ pub fn router(state: AppState) -> Router {
         .route("/models", get(public::models))
         .fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({"error":{"code":"not_found","message":"This endpoint is not supported"}}))) })
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(state.clone(), crate::deployment::admission))
         .with_state(state)
 }
 async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -223,6 +228,9 @@ async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     ))
 }
 async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    if state.deployment.planned() {
+        return Err(Error::new(503, "node_draining", "This incarnation is handing off").into());
+    }
     let _ = health(State(state.clone())).await?;
     if let Some(cluster) = state.cluster.as_ref().filter(|c| c.router)
         && !cluster
@@ -239,7 +247,9 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         )
         .into());
     }
-    Ok(Json(json!({"status":"ready"})))
+    Ok(Json(
+        json!({"status":"ready", "node_id":state.cluster.as_ref().map(|c|c.store.node_id()), "boot_id":state.cluster.as_ref().map(|c|c.boot_id)}),
+    ))
 }
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
     let mut response = next.run(request).await;

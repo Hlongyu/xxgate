@@ -13,6 +13,7 @@ XXGate 支持一个入口和多个工作节点共享 PostgreSQL。每个账号�
 | `XXGATE_NODE_URL` | 集群其他节点可访问的本节点 HTTP(S) origin，不含路径、查询参数或认证信息 |
 | `XXGATE_CLUSTER_TOKEN` | 所有节点一致的内部认证密钥，至少 32 字节；独立于对外 API Key |
 | `DATABASE_URL` | 所有节点连接同一 PostgreSQL 数据库 |
+| `XXGATE_WAIT_FOR_NODE_LOCK_SECS` | 候选 worker 等待账号锁的秒数，默认 0；蓝绿示例为 3600 |
 | `XXGATE_DB_POOL_SIZE` | 每个进程连接池大小，默认 24；应给迁移、监控和管理员连接留余量 |
 | `XXGATE_MASTER_KEY` | 所有节点保持一致，沿用原凭证加密主密钥 |
 
@@ -22,18 +23,19 @@ XXGate 支持一个入口和多个工作节点共享 PostgreSQL。每个账号�
 
 生产镜像必须在本地构建并测试 Linux amd64 版本，导出后带 SHA-256 校验和传输。生产只校验、加载镜像和使用 `docker compose up -d --no-build` 启动，禁止在生产编译。
 
-## 停机升级与显式迁移
+## 蓝绿发布与显式迁移
 
-服务启动只检查 schema 版本和校验和，不会自动迁移。旧进程、所有入口和工作节点均停止后，使用同一个发布镜像执行 `xxgate-server migrate`，完成后再启动服务。`xxgate-server check-schema` 可只读检查版本。迁移与运行进程使用互斥的数据库门闩；旧版单实例正在运行时迁移也会拒绝执行。
+入口和 worker 支持计划交接协议 1。蓝绿入口使用不同的节点 ID、URL、回环端口和 Docker alias；worker 的**逻辑 ID 保持不变**，其物理 URL/alias 随版本变化。账号、会话归属和身份映射无需在线搬迁。
 
-`compose.cluster.production.yaml` 是复用现有生产库的配置，不创建或删除数据库卷，沿用 `xxgate-private`、`code-internal`、内部 `xxgate` 别名和回环端口 8797。切换前停止原 `xxgate` 容器并从 `code-internal` 断开，避免同名 DNS 别名指向旧容器。随后运行：
+候选 worker 配置 `XXGATE_WAIT_FOR_NODE_LOCK_SECS=3600`，先持有独占 standby 锁并通过只读检查，控制接口报告 `standby`。旧 worker 校验双方 boot ID 和候选状态后进入 draining：已经接收的请求和流响应完整结束，新请求等待。排空超时则取消本次发布并继续运行旧版。成功排空后等待后台任务收尾、释放账号锁，新版加载最新状态、接管同一 ID；旧 worker 转发等待中的请求，整个过程不重试生成。正在进行的 OAuth 授权会阻止交接。
 
-```sh
-docker compose --env-file cluster.env -f compose.cluster.production.yaml run --rm --no-deps entry migrate
-docker compose --env-file cluster.env -f compose.cluster.production.yaml up -d --no-build --wait
-```
+Nginx 在候选入口 ready 后平滑切换 upstream，保留旧入口上的 SSE 和 WebSocket。`/readyz` 包含 boot ID，发布工具通过稳定 Nginx 地址验证实际切换结果；`/internal/deployment` 要求 cluster token，提供 phase 和完整响应/连接计数。旧进程不会按固定秒数强杀，退役前需确认无在途连接。内部调用方必须经过同一个稳定代理。
 
-迁移 0021 改变统计表唯一键，属于不兼容升级；不能只换回旧镜像。通常先备份，若用户明确接受无备份停机升级，可以跳过备份；失败后保留原卷并修复向前，不自动清空数据库或恢复旧镜像。`/healthz` 检查进程和数据库，入口的 `/readyz` 还要求有在线、接收新会话的工作节点；空载新集群在添加启用账号前可能尚未 ready。
+完整配置、发布脚本、回退方法及首次启用限制见 [生产发布说明](../deploy/README.md#蓝绿发布兼容-schema)。`rollout-cluster.py` 校验、预热并交接 worker；`bluegreen-switch.py` 负责可验证的 Nginx 切换。
+
+当前只支持相同 schema 的蓝绿发布。服务启动检查迁移版本和校验和，发布预检不会执行 DDL。不兼容迁移被拒绝，不能用旧停机脚本绕过零停机要求。未来新增 schema 变更必须设计并验证 expand/contract 发布阶段。
+
+历史迁移 0021 改变统计表唯一键，不能与旧单节点版本同时使用，也不能只切回旧镜像；离线维护迁移仍由 `xxgate-server migrate` 显式执行并持有数据库互斥门闩。已有运行节点会阻止这类迁移。
 
 ## 账号和管理
 

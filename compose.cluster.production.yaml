@@ -1,5 +1,7 @@
 # Reuses the existing xxgate production database and data volume.
-# Stop the old xxgate service, run `entry migrate`, then start these services.
+# For compatible releases, stage a second Compose project with unique URLs,
+# entry ID and host port. Workers retain their logical IDs and wait in standby
+# until rollout-cluster.py hands off ownership. Switch Nginx only after ready.
 name: xxgate-cluster
 
 x-app: &app
@@ -30,34 +32,36 @@ services:
     environment:
       <<: *environment
       XXGATE_ROLE: router
-      XXGATE_NODE_ID: entry
-      XXGATE_NODE_URL: http://xxgate-entry:8787
+      XXGATE_NODE_ID: ${XXGATE_ENTRY_NODE_ID:-entry}
+      XXGATE_NODE_URL: http://${XXGATE_ENTRY_ALIAS:-xxgate-entry}:8787
     ports: ["127.0.0.1:${XXGATE_HOST_PORT:-8797}:8787"]
     mem_limit: ${XXGATE_ENTRY_MEMORY:-512m}
     networks:
-      private: {aliases: [xxgate-entry]}
-      ingress: {aliases: [xxgate]}
+      private: {aliases: ["${XXGATE_ENTRY_ALIAS:-xxgate-entry}"]}
+      ingress: {aliases: ["${XXGATE_INGRESS_ALIAS:-xxgate}"]}
   worker-a:
     <<: *app
     environment:
       <<: *environment
       XXGATE_ROLE: worker
-      XXGATE_NODE_ID: default
-      XXGATE_NODE_URL: http://xxgate-worker-a:8787
+      XXGATE_NODE_ID: ${XXGATE_WORKER_A_NODE_ID:-default}
+      XXGATE_WAIT_FOR_NODE_LOCK_SECS: ${XXGATE_WAIT_FOR_NODE_LOCK_SECS:-0}
+      XXGATE_NODE_URL: http://${XXGATE_WORKER_A_ALIAS:-xxgate-worker-a}:8787
     mem_limit: ${XXGATE_WORKER_MEMORY:-1g}
     networks:
-      private: {aliases: [xxgate-worker-a]}
+      private: {aliases: ["${XXGATE_WORKER_A_ALIAS:-xxgate-worker-a}"]}
       egress: {}
   worker-b:
     <<: *app
     environment:
       <<: *environment
       XXGATE_ROLE: worker
-      XXGATE_NODE_ID: worker-b
-      XXGATE_NODE_URL: http://xxgate-worker-b:8787
+      XXGATE_NODE_ID: ${XXGATE_WORKER_B_NODE_ID:-worker-b}
+      XXGATE_WAIT_FOR_NODE_LOCK_SECS: ${XXGATE_WAIT_FOR_NODE_LOCK_SECS:-0}
+      XXGATE_NODE_URL: http://${XXGATE_WORKER_B_ALIAS:-xxgate-worker-b}:8787
     mem_limit: ${XXGATE_WORKER_B_MEMORY:-512m}
     networks:
-      private: {aliases: [xxgate-worker-b]}
+      private: {aliases: ["${XXGATE_WORKER_B_ALIAS:-xxgate-worker-b}"]}
       egress: {}
 
 networks:

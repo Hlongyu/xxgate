@@ -8,3 +8,4 @@ mod model_version;
 mod telemetry;
 
 pub mod cluster;
+pub mod deployment;

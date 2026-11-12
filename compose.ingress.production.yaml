@@ -1,0 +1,30 @@
+# Stable front door for public Nginx and Docker callers; independent of releases.
+name: xxgate-ingress
+services:
+  ingress:
+    image: ${XXGATE_NGINX_IMAGE:?required}
+    restart: unless-stopped
+    entrypoint: [nginx, -g, "daemon off;", -c, /etc/nginx/xxgate/nginx.conf]
+    volumes:
+      - ${XXGATE_INGRESS_CONFIG_DIR:?required}:/etc/nginx/xxgate:ro
+    ports: ["127.0.0.1:${XXGATE_INGRESS_PORT:-8796}:8787"]
+    networks:
+      ingress: {aliases: [xxgate]}
+      private: {}
+    read_only: true
+    tmpfs: ["/var/cache/nginx:rw,nosuid,size=32m", "/var/run:rw,nosuid,size=1m"]
+    mem_limit: 128m
+    pids_limit: 64
+    security_opt: ["no-new-privileges:true"]
+    stop_signal: SIGQUIT
+    stop_grace_period: 1h
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+networks:
+  ingress:
+    external: true
+    name: ${XXGATE_SUB2API_NETWORK:-code-internal}
+  private:
+    external: true
+    name: ${XXGATE_DATABASE_NETWORK:-xxgate-private}

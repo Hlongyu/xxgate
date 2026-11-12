@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Database schema matches this image");
             Ok(())
         }
-        _ => anyhow::bail!("Usage: xxgate-server [migrate|check-schema]"),
+        [command] if command == "preflight" => xxgate_server::bootstrap::preflight().await,
+        _ => anyhow::bail!("Usage: xxgate-server [migrate|check-schema|preflight]"),
     }
 }

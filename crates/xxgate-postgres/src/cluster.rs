@@ -85,8 +85,20 @@ impl PgStore {
     }
 
     pub async fn register_node(&self, role: &str, url: &str, boot: Uuid) -> Result<()> {
-        sqlx::query("INSERT INTO cluster_nodes(id,role,url,boot_id) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET role=EXCLUDED.role,url=EXCLUDED.url,boot_id=EXCLUDED.boot_id,heartbeat_at=now(),accepting=false,runtime='{}'")
-            .bind(&self.node_id).bind(role).bind(url).bind(boot).execute(&self.pool).await.map_err(|_| Error::storage())?;
+        self.register_ready_node(role, url, boot, false, serde_json::json!({}))
+            .await
+    }
+
+    pub async fn register_ready_node(
+        &self,
+        role: &str,
+        url: &str,
+        boot: Uuid,
+        accepting: bool,
+        runtime: Value,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO cluster_nodes(id,role,url,boot_id,accepting,runtime) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET role=EXCLUDED.role,url=EXCLUDED.url,boot_id=EXCLUDED.boot_id,heartbeat_at=now(),accepting=EXCLUDED.accepting,runtime=EXCLUDED.runtime")
+            .bind(&self.node_id).bind(role).bind(url).bind(boot).bind(accepting).bind(runtime).execute(&self.pool).await.map_err(|_| Error::storage())?;
         Ok(())
     }
 

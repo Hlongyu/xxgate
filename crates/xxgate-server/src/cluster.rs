@@ -39,6 +39,56 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    pub(crate) async fn deployment_status(&self, url: &str) -> Result<Value> {
+        self.client
+            .get(format!("{}/internal/deployment", url.trim_end_matches('/')))
+            .header(TOKEN_HEADER, &self.token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|_| {
+                Error::new(
+                    503,
+                    "candidate_unavailable",
+                    "Candidate control endpoint is unavailable",
+                )
+            })?
+            .error_for_status()
+            .map_err(|_| {
+                Error::new(
+                    503,
+                    "candidate_unavailable",
+                    "Candidate control endpoint rejected verification",
+                )
+            })?
+            .json()
+            .await
+            .map_err(|_| Error::invalid("Invalid candidate status"))
+    }
+    pub(crate) async fn successor_ready(&self, node: &Node) -> bool {
+        let Ok(response) = self
+            .client
+            .get(format!(
+                "{}/internal/deployment",
+                node.url.trim_end_matches('/')
+            ))
+            .header(TOKEN_HEADER, &self.token)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let Ok(value) = response.json::<Value>().await else {
+            return false;
+        };
+        value["node_id"] == node.id
+            && value["boot_id"] == node.boot_id.to_string()
+            && value["phase"] == "serving"
+    }
     pub fn new(
         store: Arc<PgStore>,
         router: bool,
@@ -276,7 +326,7 @@ impl Cluster {
         Ok(())
     }
 
-    pub async fn publish(&self, state: &AppState) -> Result<()> {
+    fn advertisement(&self, state: &AppState) -> (bool, Value) {
         let stats = state.gateway.scheduler.stats();
         let capacity = state
             .gateway
@@ -293,8 +343,27 @@ impl Cluster {
             && capacity > 0
             && !stats.paused
             && !memory.blocked
-            && !state.gateway.shutdown.is_cancelled();
+            && (!state.gateway.shutdown.is_cancelled()
+                || state.deployment.phase() == "transferring");
+        (accepting, runtime)
+    }
+
+    pub async fn publish(&self, state: &AppState) -> Result<()> {
+        let (accepting, runtime) = self.advertisement(state);
         self.store.heartbeat(self.boot_id, accepting, runtime).await
+    }
+
+    pub(crate) async fn register(&self, state: &AppState, url: &str) -> Result<()> {
+        let (accepting, runtime) = self.advertisement(state);
+        self.store
+            .register_ready_node(
+                if self.router { "router" } else { "worker" },
+                url,
+                self.boot_id,
+                accepting,
+                runtime,
+            )
+            .await
     }
 
     pub async fn broadcast_reload(&self) {
@@ -419,7 +488,9 @@ pub fn start(state: AppState) {
             }
             if let Err(error)=result {tracing::warn!(code=%error.code,"cluster coordination unavailable; pausing new dispatch");}
         }
-        let _=tokio::time::timeout(Duration::from_secs(3),cluster.store.heartbeat(cluster.boot_id,false,json!({"stopped":true}))).await;
+        if !state.deployment.planned() {
+            let _=tokio::time::timeout(Duration::from_secs(3),cluster.store.heartbeat(cluster.boot_id,false,json!({"stopped":true}))).await;
+        }
     }});
 }
 

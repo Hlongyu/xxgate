@@ -15,7 +15,10 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--entry-container", default="xxgate-cluster-entry-1")
+    parser.add_argument("--local-port", type=int, default=8797,
+                        help="candidate entry port bound on loopback")
     parser.add_argument("--public-url", required=True)
+    parser.add_argument("--expected-worker", action="append", help="repeat for required worker IDs")
     args = parser.parse_args()
     entry = json.loads(subprocess.check_output(["docker", "inspect", args.entry_container]))[0]
     env = dict(v.split("=", 1) for v in entry["Config"]["Env"] if "=" in v)
@@ -27,7 +30,7 @@ def main():
         headers = {"Content-Type": "application/json", "X-XXGate-CSRF": "1"}
         if cookie:
             headers["Cookie"] = cookie
-        request = urllib.request.Request("http://127.0.0.1:8797/api/admin" + path,
+        request = urllib.request.Request(f"http://127.0.0.1:{args.local_port}/api/admin" + path,
                                          headers=headers, method=method,
                                          data=None if data is None else json.dumps(data).encode())
         with opener.open(request, timeout=20) as response:
@@ -37,10 +40,12 @@ def main():
 
     admin("/login", "POST", {"password": env["XXGATE_ADMIN_PASSWORD"]})
     nodes = admin("/nodes")["items"]
-    assert {n["id"] for n in nodes} == {"entry", "default", "worker-b"}
-    assert all(n["online"] for n in nodes)
+    expected_workers = set(args.expected_worker or ["default", "worker-b"])
+    expected_nodes = expected_workers | {env["XXGATE_NODE_ID"]}
+    online = {n["id"] for n in nodes if n["online"]}
+    assert expected_nodes <= online, "Required candidate/worker nodes are not online"
     accounts = admin("/accounts")["items"]
-    assert all(a["node_id"] == "default" for a in accounts)
+    assert all(a["node_id"] in expected_workers for a in accounts)
     keys_before = len(admin("/keys")["items"])
     temporary = admin("/keys", "POST", {"name": "cluster-release-verification"})
     try:

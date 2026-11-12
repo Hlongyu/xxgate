@@ -38,6 +38,7 @@ impl Drop for SessionGuard {
 
 pub async fn responses(
     State(state): State<AppState>,
+    admission: Option<axum::Extension<crate::deployment::Admission>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
@@ -63,6 +64,7 @@ pub async fn responses(
         .max_message_size(limit)
         .max_frame_size(limit)
         .on_upgrade(move |socket| async move {
+            let _admission = admission;
             let _permit = permit;
             let session = SessionGuard {
                 id: Uuid::new_v4(),

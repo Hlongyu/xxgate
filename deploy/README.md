@@ -9,15 +9,17 @@
   https://xxgate.example.com
   → HTTPS 边缘 Nginx
   → 私有隧道 → 源站 Nginx
-  → 127.0.0.1:8797 → xxgate:8787
+  → 稳定 upstream → blue/green XXGate 入口
 
 可选的 sub2api 等内部调用方
-  → 共享 Docker 网络 → http://xxgate:8787/v1
+  → 稳定 Nginx 入口 → blue/green XXGate 入口
 
 xxgate → xxgate-private 网络 → xxgate-db:5432
 ```
 
-`nginx/` 中的 `xxgate.example.com`、`192.0.2.10`（边缘地址）和 `192.0.2.20`（源站地址）都是示例，部署前替换为自己的域名与私有隧道地址。源站模板仅允许边缘地址访问；不要把源站或数据库直接暴露到公网。单机部署可由 HTTPS Nginx 直接回源 `127.0.0.1:8797`。
+`nginx/` 中的 `xxgate.example.com`、`192.0.2.10`（边缘地址）和 `192.0.2.20`（源站地址）都是示例，部署前替换为自己的域名与私有隧道地址。源站模板仅允许边缘地址访问；不要把源站或数据库直接暴露到公网。源站 Nginx 通过 `xxgate-active-upstream.inc` 指向当前颜色，监听端口保持不变。
+
+如果调用方仍然使用 Docker 网络里的 `http://xxgate:8787`，这个别名必须指向稳定 Nginx 入口；直接指向某个 XXGate 容器会绕过蓝绿切换。可以把 Nginx 作为共享网络中的固定入口服务，或让调用方改用源站 Nginx 的私网地址。
 
 两级代理关闭响应/请求缓冲、代理缓存、Nginx 自身压缩和自动重试，读取/发送超时为 3600 秒。XXGate 对管理 JSON、HTML、JS、CSS 协商 Brotli/gzip，Responses/SSE 不经过应用压缩层。保留 `Accept-Encoding` 与 `Content-Encoding`。
 
@@ -105,9 +107,68 @@ curl --fail https://xxgate.example.com/healthz
 
 健康检查不能替代模型兼容性验证。上游账户支持哪些模型、独立 Compact 是否可用，取决于上游能力；应使用自己的测试账户核验。
 
+## 蓝绿发布（兼容 schema）
+
+此路径覆盖入口和工作节点。数据库、账号归属、Key、主密钥和会话绑定保持原样；蓝绿使用不同容器地址，worker 继续使用原逻辑 `node_id`。新 worker 先持有唯一 standby 锁，校验 schema/凭证后对控制面报告 `standby`，不会处理生成请求。旧 worker 排空已经接收的响应后结束后台任务，再释放账号锁；新 worker 重新加载持久状态、接管账号并报告 ready。旧监听器变成到新 worker 的转发入口，等待中的请求只发送一次。新请求在交接期间可能排队，正常流量切换不重放生成请求。
+
+旧版必须已经支持 `/internal/deployment` 的协议 1；脚本发现旧版没有该协议时会直接拒绝。首次安装这项能力需要单独安排引导升级，不能把不支持交接的旧二进制宣称为零停机。此处没有自动执行旧停机脚本。当前生产若仍是旧版，不要直接停止它来绕过预检。
+
+源站 Nginx 使用稳定 `xxgate_active` upstream。把 `nginx/xxgate-origin.conf` 的 upstream 和 proxy_pass 合并到**现有域名、TLS、访问限制配置**，不要直接覆盖已经运行的站点。将默认地址文件放到 `/etc/nginx/xxgate-active-upstream.inc`；它仅在 upstream 内 include，不能作为 `conf.d/*.conf` 被重复加载：
+
+```nginx
+upstream xxgate_active {
+    include /etc/nginx/xxgate-active-upstream.inc;
+    keepalive 32;
+}
+# 在现有 location 中：proxy_pass http://xxgate_active;
+```
+
+初始文件为 `server 127.0.0.1:8797;`。先 `nginx -t`，再 reload。继续保留 `proxy_next_upstream off`、SSE 关闭缓冲、Upgrade 透传及下划线身份头设置。不要设置会在发布中强制终止长连接的 `worker_shutdown_timeout`。Nginx reload 会让旧 worker 服务现存连接直至完成，参见 [Nginx 官方说明](https://nginx.org/en/docs/control.html)。
+
+内部调用方也必须通过稳定 Nginx。若使用 `http://xxgate:8787`，该 Docker alias 应属于稳定代理；不能同时留在某个应用容器上。候选应用只使用自己的独立 alias。
+
+### 发布命令
+
+先按照前文在本地构建、测试 Linux amd64 镜像，导出并传输 SHA-256 校验文件。生产校验后 `docker load`。复制当前 `cluster.env` 为权限 0600 的 `green.env`，沿用全部凭证、数据库网络及 cluster token，按 [bluegreen.env.example](bluegreen.env.example) 只覆盖镜像、端口、独立 alias 和入口 ID。旧入口通常为 8797，新入口为 8798。每次必须使用没有在运行的 Compose project/alias，worker ID 保持原值。
+
+```sh
+python3 deploy/rollout-cluster.py \
+  --env-file green.env --project xxgate-green \
+  --source-entry xxgate-cluster-entry-1 \
+  --source-worker-a xxgate-cluster-worker-a-1 \
+  --source-worker-b xxgate-cluster-worker-b-1 \
+  --record release-green.json
+```
+
+脚本运行于 Linux Docker 宿主机，通过数据库私网 IP 访问控制接口。它只使用已加载镜像和 `--no-build --pull never --no-deps`，先执行只读 `preflight`，检查全部旧节点/候选配置/独立 alias，再启动候选入口和两个 standby worker，逐个交接。完成后记录 `ready_for_nginx_switch`。空账号 worker 不要求具有可派发容量，但必须正确持有节点锁并报告 serving。
+
+将 `--probe-url` 替换为调用方实际使用且发布主机能访问的稳定 Nginx origin，然后切换入口：
+
+```sh
+python3 deploy/bluegreen-switch.py \
+  --backend http://127.0.0.1:8798 \
+  --expected-backend http://127.0.0.1:8797 \
+  --probe-url https://xxgate.example.com \
+  --upstream-file /etc/nginx/xxgate-active-upstream.inc \
+  --state-file bluegreen-state.json
+```
+
+切换脚本以文件锁串行化发布，检查预期旧地址，原子替换 include，执行 `nginx -t` / reload，并通过稳定入口核对候选 `boot_id`。reload 只发送信号，因此命令返回成功不能代替此检查。失败会恢复旧文件、再次 reload 并核验旧实例；若回退无法核验，明确报告 `rollback_unverified`，保留两套进程。
+
+### 排空、回退和边界
+
+- 默认排空期限为 300 秒，最多 3600 秒。期限内未排空则恢复旧 worker；不会取消正在生成的响应。交接期间新请求有等待延迟，受客户端超时影响，等待入口上限 256；超过上限明确返回 `handoff_capacity`，不是无限内存队列。持续长流量下应选择能容纳最长请求的发布窗口/客户端超时。
+- 原有入口 WebSocket 保持连接，各轮继续路由到同一个逻辑 worker。工作节点不作为公共 WebSocket 入口。正在浏览器或设备授权时拒绝交接，避免丢失进程内授权状态。
+- 账号锁只在 HTTP/流响应及后台持久化任务完成后释放。候选必须通过身份匹配的 standby 探针；同一节点仅允许一个候选，避免并发发布抢占。候选无法激活时保留旧转发入口和日志，不自动强杀或恢复数据库。此协议解决计划发布，不保证服务器、数据库或网络故障时的在途生成无损。
+- 旧入口和 worker 不会被自动停止。保留它们至 Nginx 旧连接结束、旧入口 `/internal/deployment` 的 `active` 为 0、旧 worker 为 `forwarding` 且 `active` 为 0，再退役；不要用固定 sleep 或 `docker compose down` 代替确认。发布脚本停止旧 worker 的自动重启，防止未来重启成抢锁进程。
+- **入口回退**：反向执行切换脚本，交换 backend/expected-backend，仍然核验实际 `boot_id`。**worker 回退**：旧 worker 已经交出所有权，不能靠切 Nginx 恢复旧执行代码；使用旧镜像启动新的 standby，再按同一交接协议回退。旧镜像也必须支持协议 1 且 schema 兼容。每轮记录保留镜像 ID 和 boot ID。
+- 本轮没有修改数据库结构。只允许相同迁移版本和校验和的镜像并行运行；不兼容版本在切流前拒绝。未来 schema 变更需要先做经过验证的 expand/contract 分阶段迁移，不能直接解除迁移互斥锁或随意放宽版本校验。`upgrade-cluster.py` 是历史停机迁移工具，不属于这条发布路径。
+
+验证：`python3 -B -m unittest discover -s deploy/tests` 使用真实本地 Nginx 验证 SSE、WebSocket、实际切流和失败回退；`XXGATE_TEST_PG_BIN=/path/to/postgresql/bin python3 scripts/test.py worker_handoff` 使用真实进程与临时数据库验证账号锁、standby 排他性、排空取消、不重复派发及 WebSocket 后续轮次。
+
 ## 更新、备份与恢复
 
-更新前保留当前 `.env`、镜像标记、部署配置和数据库快照。以生产备份恢复隔离数据库验证候选镜像；正式切换前暂停新请求并等待在途请求结束。保留旧镜像以便回退，避免新旧程序同时写入不兼容的派生统计。
+更新前保留当前 `.env`、镜像标记、部署配置和数据库快照。以生产备份恢复隔离数据库验证候选镜像；蓝绿切换前确认候选与旧版本的 schema 兼容，并保留旧镜像以便回退。入口切换使用上面的稳定 upstream；需要修改 schema 的版本仍需按停写迁移流程执行。
 
 ```sh
 cd /opt/xxgate
@@ -123,3 +184,18 @@ cp .env backups/production.env
 迁移 0010 从最近 8 天仍存在的请求回填账户金额明细和小时汇总。升级前停止旧版本写入，避免漏算；若回退到迁移 0010 之前的程序，随后再次升级必须在停写与备份后重建相关派生统计。回退方案应在隔离副本上验证，不通过覆盖数据库来丢弃当前业务数据。
 
 迁移 0013 为 30days 周期回填最近 31 天仍保留的请求，只补充缺失的金额/Token 明细，并重建对应小时汇总。必须在旧程序停止写入后迁移；旧版本仍会按 8 天清理，所以回退后再次升级不能仅跳过已执行的迁移，应在备份和停写后重新回填、重建汇总并重设历史完整性边界。新版本精简统计和额度样本保留 31 天，原始请求详情继续使用管理员设置的期限。候选检查包含账户套餐、30days 周期、历史完整性提示及 `/assets/account-quotas.js`。
+
+### Docker 内部别名也经过稳定入口
+
+`compose.ingress.production.yaml` 和 `nginx/xxgate-ingress.conf` 提供独立于应用版本的稳定 Nginx 容器。它在 `code-internal` 独占 `xxgate:8787` 别名，宿主回环映射为 `8796`；已有宿主 Nginx 只需将本服务的回源改为 `127.0.0.1:8796`。应用 entry 的 `XXGATE_INGRESS_ALIAS` 必须是独立名称，不能继续使用 `xxgate`。
+
+将完整配置复制为 `${XXGATE_INGRESS_CONFIG_DIR}/nginx.conf`，并创建同目录 `active-upstream.inc`，内容为 `server <当前 entry 的私网 IP>:8787;`。目录整体挂载以支持原子替换 include；单文件 bind mount 会一直引用旧 inode。固定 `XXGATE_NGINX_IMAGE` 为已校验的官方镜像 digest；本地拉取/导出并附带 SHA-256 传输后，在生产仅加载并 `up -d --no-build --pull never`。
+
+此模式的切换参数使用候选/旧 entry 的 Docker 私网 IP、宿主上的 include 路径、`--probe-url http://127.0.0.1:8796`；Nginx 命令参数为：
+
+```sh
+--nginx-test 'docker exec xxgate-ingress-ingress-1 nginx -t -c /etc/nginx/xxgate/nginx.conf' \
+--nginx-reload 'docker exec xxgate-ingress-ingress-1 nginx -s reload -c /etc/nginx/xxgate/nginx.conf'
+```
+
+核验公网地址和内部别名返回相同 boot ID。应用容器被重新创建或 IP 发生变化时必须重新检查地址并切换 include；不要在发布流程之外直接重建 active entry。稳定代理自身的升级需要单独维护，不随每次 XXGate 发布重建。
