@@ -316,3 +316,16 @@ Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在
 新增 websocket_http_fallback 审计，保留失败原因、协议变化与绑定；成功回退不精简诊断，后台时间线显示回退动作。无需数据库迁移，不改变账户协议开关或线上配置。
 
 验证：157 项 Rust 测试及 27 项前端测试通过，Clippy 全目标禁止警告、格式和 diff 检查通过。真实 HTTP/WS/PostgreSQL 用例覆盖 18 MiB 请求回退、流式/非流式、WS 增量失败后完整历史恢复、握手拒绝和错误升级、静默超时、控制事件/输出/业务错误后不回退、原生 WS 不回退、密文恢复与回退合计最多两次、Key 撤销、真实 TCP 取消，以及双节点集群中固定工作节点和账户的回退。初轮合成上游的 HTTP JSON 默认 2 MiB 限制阻挡了 18 MiB 验证，调整测试上游限制后完成；大 WS 帧可能在发送阶段失败，审计检查兼容尚未收到首次响应头的情况。日志位于 `/tmp/xxgate-ws-http-fallback-tests.log`、`/tmp/xxgate-ws-http-fallback-web.log` 和 `/tmp/xxgate-ws-http-fallback-clippy.log`。未提交、未部署。
+## 2026-11-12 蓝绿发布上线
+
+代码提交 `391c117` 已推送，发布镜像为 `local/xxgate:20261112-bluegreen-391c117`。本地完成 164 项 Rust 测试（含临时 PostgreSQL/真实 HTTP、SSE、WebSocket 和进程交接）、27 项前端测试、6 项部署测试，以及 Clippy、fmt、Compose 和 Nginx 配置验证。Linux amd64 成品镜像另通过证书检查、双 worker 的 7 次模拟请求、交接和稳定 Nginx 入口测试。
+
+镜像在开发机构建并导出 Docker archive，SHA-256 为 `f854a8181f22cf3248bb0991bfd9507ddfbf0da648f05037f4e2a908fcfcafd5`。生产仅校验、加载、预检和 `--no-build --pull never` 启动。Docker 导入重新序列化了配置，因此进一步核对全部 rootfs diff ID、运行配置和源码指纹；导入 ID 为 `sha256:6455e8323ddd1b4f015f46ebcb324797304fc7c8e61f4985ba3de6f4dad87fcf`，内容验证一致。
+
+用户明确允许本次线上停机。2026-11-12 22:37:19–22:38:26（Asia/Shanghai）完成从旧版到交接协议 1 的首次升级，切换窗口约 66 秒。上线前备份数据库和旧配置，数据库备份 592,550,341 字节，已校验 SHA-256 与恢复目录。没有执行 schema 迁移，继续使用 schema 21 和 `xxgate_postgres_data`；6 个账号、5 个有效 Key、原 Key 哈希、运行凭证及最近一天 10,498 条请求 ID 核对通过。
+
+随后在真实流量下执行 blue → green 演练，等待已有生成结束后交接两个 worker，再验证 Nginx 实际返回的 boot ID。期间 865 次就绪探测全部返回成功；公网入口和 Docker 网络的 `xxgate:8787` 指向同一绿色入口。保留的旧连接结束后停止了蓝色进程，没有强制截断演练中的请求。
+
+公网页面、静态资源、健康接口正常；使用现有分组和 Codex 来源配置，以 `gpt-5.6-sol` 完成两次真实生成：SSE 约 6.77 秒、原生 WebSocket 101 升级后生成约 1.76 秒。测试只创建临时 Key，全部已删除，原有 5 个有效 Key 保持不变。
+
+当前生产 Compose project 为 `xxgate-green`，稳定代理为 `xxgate-ingress-ingress-1`；宿主 Nginx 仅将 XXGate 回源改到 `127.0.0.1:8796`，域名、TLS 和访问限制保留。部署、回退与核验记录位于 `/opt/xxgate/releases/20261112-bluegreen-391c117`，`/opt/xxgate/current` 指向该目录；运行配置为 `green.env` 和 `ingress.env`（0600）。备份位于 `/opt/xxgate/backups/20261112-bluegreen-391c117`。此路径支持相同 schema 的计划发布，不将不兼容迁移或服务器故障宣称为零停机。
