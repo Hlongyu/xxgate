@@ -329,3 +329,15 @@ Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在
 公网页面、静态资源、健康接口正常；使用现有分组和 Codex 来源配置，以 `gpt-5.6-sol` 完成两次真实生成：SSE 约 6.77 秒、原生 WebSocket 101 升级后生成约 1.76 秒。测试只创建临时 Key，全部已删除，原有 5 个有效 Key 保持不变。
 
 当前生产 Compose project 为 `xxgate-green`，稳定代理为 `xxgate-ingress-ingress-1`；宿主 Nginx 仅将 XXGate 回源改到 `127.0.0.1:8796`，域名、TLS 和访问限制保留。部署、回退与核验记录位于 `/opt/xxgate/releases/20261112-bluegreen-391c117`，`/opt/xxgate/current` 指向该目录；运行配置为 `green.env` 和 `ingress.env`（0600）。备份位于 `/opt/xxgate/backups/20261112-bluegreen-391c117`。此路径支持相同 schema 的计划发布，不将不兼容迁移或服务器故障宣称为零停机。
+
+## 2026-11-18 ultrafast 上线
+
+功能提交 `12c52c7` 已推送，发布镜像为 `local/xxgate:20261118-ultrafast-12c52c7`。`service_tier=ultrafast` 原样转发，沿用模型 Fast 能力开关；请求记录、SSE/Compact 用量解析、计价及后台档位筛选同步支持。实际档位为 ultrafast 时使用 `fast_multiplier`，请求超快档位但实际档位未知时不推算费用。
+
+新增单测、真实 HTTP/PostgreSQL 端到端测试、29 项前端测试、Clippy 和格式检查通过。全量 Rust 回归存在 WebSocket 握手相关失败，其中集群预热和 WebSocket 集成两项在修改前版本同样复现，未宣称全量通过。Linux amd64 成品在开发机构建，通过系统证书检查，以及隔离 PostgreSQL、双 worker 的 7 次 ultrafast 模拟请求、计价、交接和 Nginx 入口验证。
+
+镜像 Docker archive SHA-256 为 `06c8907c7ade432ec3e8e431442b1ef7dbf383dfebe19a384e0ff5254f6099a1`；生产仅校验、加载、只读预检及 `--no-build --pull never` 启动，核对 rootfs diff ID、运行配置及源码指纹。按用户后续指示取消备份，清理本次已生成的备份文件，未保留本次数据库或配置备份；此前备份未改动。没有执行 schema 迁移，保留 schema 21、原数据卷、6 个账户、5 个有效 Key 及原 Key 哈希、主密钥和运行凭证。
+
+2026-11-18 08:51（Asia/Shanghai）完成 worker 交接和稳定入口切换，36 次就绪探测全部成功。当前 project 为 `xxgate-ultrafast-12c52c7`，入口 ID 为 `entry-ultrafast-12c52c7`；公网、内部稳定入口及 Docker `xxgate:8787` 返回同一 boot ID。`/opt/xxgate/current` 指向 `/opt/xxgate/releases/20261118-ultrafast-12c52c7`，运行配置为 `release.env` 和 `ingress.env`（0600）。旧绿色进程关闭自动重启，保留用于已有连接自然排空。
+
+公网 `gpt-5.6-sol` 的 ultrafast SSE 和原生 WebSocket 生成均成功，分别约 1.90 秒和 1.30 秒。两次上游实际档位均为 `default`，请求记录按实际标准价计费，不据此宣称上游启用了超快档位。临时验证 Key 已删除，管理员验证会话已退出。
