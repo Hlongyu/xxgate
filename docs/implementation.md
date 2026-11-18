@@ -351,3 +351,15 @@ Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在
 发布镜像 `local/xxgate:20261118-ultrafast-pricing-b0b047d` 在本机构建，Docker archive SHA-256 为 `a1539092cfae9e76e4fbab48b423014f04cb208bc9e97c06653b262720587519`。生产仅校验、加载、预检及 `--no-build --pull never` 启动，按用户要求没有备份。2026-11-18 09:10（Asia/Shanghai）完成交接和切流，185 次就绪探测无失败；保留 schema 21、原数据卷、6 个账户、5 个有效 Key、原 Key 哈希和凭证。旧转发链保留以服务已有连接。
 
 当前 project 为 `xxgate-ultrafast-pricing-b0b047d`，`/opt/xxgate/current` 指向 `/opt/xxgate/releases/20261118-ultrafast-pricing-b0b047d`，使用 `release.env`、`ingress.env`。线上价格接口和页面已提供新字段，验证前后现有价格一致；公网 SSE 和原生 WebSocket 请求通过，上游实际档位仍为 default。临时验证 Key 已删除，管理员验证会话已退出。
+
+## 2026-11-18 按请求档位计价上线
+
+提交 `fa1d4bf` 将新请求的倍率选择改为请求 `service_tier`：fast/priority 使用 Fast 倍率，ultrafast 使用独立 Ultrafast 倍率；未指定、default 和 auto 使用标准价格。上游返回 default、其他档位或缺少档位均不改变计费倍率，返回值继续作为用量事实保存；未配置对应倍率时标为未计价，不回落到标准价或另一档位倍率。
+
+新计价结果增加冻结的 `billing_tier`、`billing_multiplier`，请求详情展示「计费档位 / 依据」，列表倍率及费用说明读取冻结值。缺少新字段的历史记录继续按历史规则展示，金额不重算；原实际档位筛选仍对应上游返回值。字段兼容旧 JSON，无数据库迁移。
+
+154 项 Rust 回归通过（沿用已记录的 WebSocket 相关测试组跳过项，共 16 项），31 项前端测试、Clippy、fmt 和 diff 检查通过。核心测试覆盖请求与返回档位不一致及返回缺失；真实 HTTP/PostgreSQL 覆盖流式、非流式请求 ultrafast 而返回 default 时仍按 3 倍计费。Linux amd64 成品通过证书检查及隔离集群 10 次请求验证：模拟上游始终返回 default，Fast 2 倍、Ultrafast 3 倍、标准价及未配置倍率分别处理，价格更新后旧倍率保持冻结，交接和 Nginx 入口正常。
+
+镜像 `local/xxgate:20261118-request-tier-fa1d4bf` 在本机构建，Docker archive SHA-256 为 `8c9d96e84ae91f347d371c97b2ec345f2646e35bc35f4aad543e4932105bb98e`。2026-11-18 12:52（Asia/Shanghai）通过预检、worker 交接和 Nginx 切流，73 次就绪探测无失败。按用户要求没有备份；保留 schema 21、原数据卷、6 个账户、5 个有效 Key、原 Key 哈希、凭证和现有模型价格，抽样旧请求计价 JSON 的哈希保持一致。
+
+公网 gpt-5.6-sol 的 SSE 和原生 WebSocket 请求成功，返回档位为 default，计费档位均为 ultrafast。该模型尚未设置 Ultrafast 倍率，两次均正确记录 unpriced_ultrafast、金额为空，未推定倍率或标准价。临时验证 Key 已删除，管理员验证会话已退出。当前 project 为 `xxgate-request-tier-fa1d4bf`，`/opt/xxgate/current` 指向 `/opt/xxgate/releases/20261118-request-tier-fa1d4bf`，使用 `release.env`、`ingress.env`；旧转发链保留以服务已有连接。
