@@ -1198,6 +1198,43 @@ async fn real_http_postgres_gateway_contract() {
         "rewritten",
     );
 
+    // Ultrafast must survive ingress, upstream forwarding, valuation and reports.
+    for stream in [false, true] {
+        let response = c
+            .response("session-main", "normal", stream, "ultrafast")
+            .await;
+        assert_eq!(response.status(), 200);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        if stream {
+            assert!(
+                response
+                    .text()
+                    .await
+                    .unwrap()
+                    .contains("\"service_tier\":\"ultrafast\"")
+            );
+        } else {
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["service_tier"],
+                "ultrafast"
+            );
+        }
+        let record = c.record(&request_id).await;
+        assert_eq!(record["request"]["requested_tier"], "ultrafast");
+        assert_eq!(record["request"]["usage"]["service_tier"], "ultrafast");
+        assert_eq!(
+            record["request"]["valuation"]["cny"],
+            c.record(&unary_id).await["request"]["valuation"]["cny"]
+        );
+        assert_eq!(
+            mock.captures.lock().await.last().unwrap().1["service_tier"],
+            "ultrafast"
+        );
+    }
+
     // A conversation started before the gateway can bring its encrypted history.
     let legacy_input = json!([
         {"type":"reasoning","id":"rs_old","encrypted_content":"PRIVATE_LEGACY_REASONING","summary":[],"internal_chat_message_metadata_passthrough":{"opaque":"PRIVATE_LEGACY_METADATA"}},
@@ -1701,6 +1738,10 @@ async fn real_http_postgres_gateway_contract() {
         .admin("/dashboard?service_tier=priority", "GET", None)
         .await;
     assert_eq!(fast["summary"]["requests"], 1);
+    let ultrafast = c
+        .admin("/dashboard?service_tier=ultrafast", "GET", None)
+        .await;
+    assert_eq!(ultrafast["summary"]["requests"], 2);
     let none = c
         .admin(
             &format!("/dashboard?key_id={}", Uuid::new_v4()),

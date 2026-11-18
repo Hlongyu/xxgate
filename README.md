@@ -107,6 +107,8 @@ WS 失败后丢弃连接。原生 WS 请求、已经收到任何响应事件（�
 
 HTTP 自动增量状态仅保存于对应 WS 连接内存，包含临时响应 ID、项数和随机连接密钥的 HMAC 指纹；不保留历史正文或新增数据库内容存储。该完整历史匹配仍有线性计算成本，可关闭自动增量而继续使用 WS。原生 WS 不承担此匹配成本。传输增量与上游提示词缓存命中是独立机制，缓存率仍以上游 usage 为准。
 
+`service_tier` 支持 `default`、`auto`、`fast`、`priority` 和 `ultrafast`。`ultrafast` 原样转发到上游，沿用模型的 Fast 能力开关与 `fast_multiplier` 计价；费用以上游返回的实际档位为准。
+
 ### 上下文压缩
 
 支持 `POST /v1/responses/compact` 和 `POST /responses/compact`，按已绑定账户转发到 Codex 上游 `/responses/compact`。接收 model、input、instructions、tools、parallel_tool_calls、reasoning、service_tier、prompt_cache_key、text、client_metadata 和 access_programs。可省略 stream 或设置 false；stream=true 返回 400。上游请求不添加 stream/store，也不发送排队心跳；成功时完整透传 JSON，包括全部 output、密文、对象 ID 和未知字段。向调用者返回可选 x-codex-turn-state，维持原有回传行为；该响应头现同时记录在请求详情中。
@@ -147,7 +149,7 @@ Search 使用 Codex 的独立 `alpha/search` JSON 协议，必需 `id` 和 `mode
 - 每次迁移创建新绑定代次，A→B→A 也不会复用旧代次的会话/线程等客户端身份 ID。绑定、映射和账户状态持久化，排队正文不落盘，重启不补发请求。
 - 队列、并发、内存、连接超时、SSE 空闲超时、排队心跳和保留期支持热更新。已有计时器以原开始时间重新计算。
 - 统计用量事实、官方额度和本地计价分别保存。人民币金额使用十进制定点数，分项保留 8 位小数；缓存 Token 从输入中拆分，推理 Token 不重复计入输出。
-- Fast/priority 采用标准价格乘以模型的 `fast_multiplier`（界面默认 2，可设大于 0 至 100），输入、缓存、输出及图片计价项使用同一倍率。采用上游确认的档位；请求 Fast 但实际档位缺失时标记未知。缺少用量、缓存细分或价格时不推定费用为零。
+- Fast/priority/ultrafast 采用标准价格乘以模型的 `fast_multiplier`（界面默认 2，可设大于 0 至 100），输入、缓存、输出及图片计价项使用同一倍率。采用上游确认的档位；请求 Fast 但实际档位缺失时标记未知。缺少用量、缓存细分或价格时不推定费用为零。
 - 凭证使用 ChaCha20-Poly1305 加密且绑定账户 ID；管理员密码使用 Argon2，Key 和会话令牌仅保存哈希。后台使用 HttpOnly/SameSite Cookie 与 CSRF 请求头。
 
 ## 上游模型与快速填价

@@ -16,7 +16,7 @@ function harness(){
   CacheMetrics:require('../cache-metrics.js'),ErrorCenter:{page(){}},setInterval(fn,ms){timers.push({fn,ms});},setTimeout(){},clearTimeout(){},clearInterval(){},
   FormData:class{constructor(form){return Object.entries(form.values);}},fetch:()=>new Promise(()=>{})};
  vm.createContext(context);
- vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,refreshCurrentPage,render};',context);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,billingFactor,usagePage,refreshCurrentPage,render};',context);
  context.fetch=async url=>{calls.push(url);return {ok:true,status:200,json:async()=>({items:[],total:calls.length})};};
  context.requestTest.state.auth=true;context.requestTest.state.page='requests';
  return {...context.requestTest,context,document,events,timers,calls,nodes,draft};
@@ -127,4 +127,29 @@ test('request transport reflects the recorded upstream path, not streaming or cu
  assert.match(h.requestTransport({state:'queued',upstream_attempts:0}),/待派发/);
  assert.match(h.requestTransport({state:'failed',upstream_attempts:0}),/未调用上游/);
  assert.match(h.requestTransport({state:'rejected',upstream_attempts:0,upstream_transport:'websocket'}),/未调用上游/,'zero attempts must never imply an upstream call');
+});
+
+
+test('ultrafast uses the historical Fast multiplier and actual tier in request rows',()=>{
+ const h=harness();
+ const r={id:'request',key_id:'key',model:'test-model',kind:'responses',state:'completed',created_at:'2026-11-05T06:00:00Z',upstream_attempts:1,
+  requested_tier:'ultrafast',usage:{service_tier:'ultrafast'},price:{fast_multiplier:'2.5'},valuation:{cny:'0.025',items:[{kind:'input',quantity:1000,cny:'0.025'}]}};
+ assert.equal(h.billingFactor(r),'2.5');
+ assert.match(h.requestRows([r]).join(''),/class="fast-badge"[^>]*>×2.5/);
+ r.usage.service_tier=null;
+ assert.equal(h.billingFactor(r),null);
+ assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
+ r.usage.service_tier='default';
+ assert.equal(h.billingFactor(r),1);
+ assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
+ r.usage.service_tier='ultrafast';r.price.fast_multiplier=null;
+ assert.equal(h.billingFactor(r),null);
+});
+
+test('usage page can select and query the ultrafast tier',async()=>{
+ const h=harness(),calls=[];
+ h.state.usageFilter={service_tier:'ultrafast'};
+ const html=await h.usagePage(async url=>{calls.push(url);return url.startsWith('/dashboard?')?{summary:{},models:[]}:{items:[]};});
+ assert.equal(calls[0],'/dashboard?service_tier=ultrafast');
+ assert.match(html,/<option value="ultrafast" selected>ultrafast<\/option>/);
 });

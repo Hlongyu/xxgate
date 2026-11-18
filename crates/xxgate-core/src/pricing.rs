@@ -181,12 +181,12 @@ pub fn value_usage(
         return result;
     };
     let actual = usage.service_tier.as_deref();
-    if actual.is_none() && matches!(requested_tier, Some("fast" | "priority")) {
+    if actual.is_none() && matches!(requested_tier, Some("fast" | "priority" | "ultrafast")) {
         result.status = "tier_unknown".into();
         return result;
     }
     let fast_rates;
-    let rates = if matches!(actual, Some("fast" | "priority")) {
+    let rates = if matches!(actual, Some("fast" | "priority" | "ultrafast")) {
         let Some(factor) = price
             .fast_multiplier
             .filter(|v| *v > Decimal::ZERO && *v <= Decimal::from(100))
@@ -387,6 +387,42 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn ultrafast_uses_confirmed_tier_and_the_fast_multiplier() {
+        let mut usage = Usage {
+            input_tokens: Some(1000),
+            cached_input_tokens: Some(500),
+            output_tokens: Some(1000),
+            complete: true,
+            ..Default::default()
+        };
+        let mut p = price();
+        let standard = value_usage(&usage, None, Some(&p)).cny.unwrap();
+        assert_eq!(
+            value_usage(&usage, Some("ultrafast"), Some(&p)).status,
+            "tier_unknown"
+        );
+        usage.service_tier = Some("ultrafast".into());
+        for requested in [None, Some("default"), Some("ultrafast")] {
+            assert_eq!(
+                value_usage(&usage, requested, Some(&p)).cny.unwrap(),
+                standard * Decimal::from(2)
+            );
+        }
+        p.fast_multiplier = None;
+        assert_eq!(
+            value_usage(&usage, Some("ultrafast"), Some(&p)).status,
+            "unpriced_fast"
+        );
+        usage.service_tier = Some("default".into());
+        assert_eq!(
+            value_usage(&usage, Some("ultrafast"), Some(&p))
+                .cny
+                .unwrap(),
+            standard
+        );
+    }
+
     #[test]
     fn fast_multiplies_all_standard_rates_and_is_frozen_in_valuation() {
         let mut p = price();

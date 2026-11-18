@@ -306,7 +306,7 @@ fn parse_with_transport(
         .transpose()?;
     if requested_tier
         .as_deref()
-        .is_some_and(|v| !["default", "auto", "fast", "priority"].contains(&v))
+        .is_some_and(|v| !["default", "auto", "fast", "priority", "ultrafast"].contains(&v))
     {
         return Err(Error::invalid("Unsupported service_tier"));
     }

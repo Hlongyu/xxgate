@@ -41,7 +41,7 @@ pub(super) fn compact_response(body: &[u8]) -> Result<Observation> {
     decoder.usage.service_tier = value
         .get("service_tier")
         .and_then(Value::as_str)
-        .filter(|tier| ["default", "priority", "fast"].contains(tier))
+        .filter(|tier| ["default", "priority", "fast", "ultrafast"].contains(tier))
         .map(str::to_owned);
     Ok(Observation {
         response_model: response_model(&value),
@@ -137,7 +137,7 @@ impl ProviderDecoder for CodexDecoder {
                     }
                 }
                 if let Some(tier) = response.get("service_tier").and_then(Value::as_str)
-                    && ["default", "priority", "fast"].contains(&tier)
+                    && ["default", "priority", "fast", "ultrafast"].contains(&tier)
                 {
                     self.usage.service_tier = Some(tier.into());
                 }
@@ -351,6 +351,39 @@ mod tests {
         identity::{Binding, SessionKey},
         types::ModelRef,
     };
+    #[test]
+    fn ultrafast_is_recorded_from_streaming_and_compact_responses() {
+        let mut ids = IdentityMap::new(
+            Binding::new(
+                SessionKey {
+                    key_id: Uuid::new_v4(),
+                    client_session_id: "tier".into(),
+                },
+                Uuid::new_v4(),
+                &ModelRef::codex("m"),
+                1,
+            ),
+            vec![],
+        );
+        let response = json!({"object":"response.compaction","service_tier":"ultrafast",
+            "output":[],"usage":{"input_tokens":1000,"output_tokens":500}});
+        let input = json!({"type":"response.completed","response":response});
+        let events = CodexDecoder::default()
+            .push(format!("data: {input}\n\n").as_bytes(), &mut ids, 4096)
+            .unwrap();
+        let usage = events[0].observation.usage.as_ref().unwrap();
+        assert_eq!(usage.service_tier.as_deref(), Some("ultrafast"));
+        assert_eq!(
+            events[0].document.value["response"]["service_tier"],
+            "ultrafast"
+        );
+        let observation = compact_response(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(
+            observation.usage.unwrap().service_tier.as_deref(),
+            Some("ultrafast")
+        );
+    }
+
     #[test]
     fn response_models_are_bounded_metadata_from_response_objects_only() {
         let mut ids = IdentityMap::new(

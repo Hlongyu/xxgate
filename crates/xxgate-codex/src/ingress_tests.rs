@@ -1,5 +1,25 @@
 use super::*;
 
+#[test]
+fn service_tiers_are_preserved_across_responses_compact_and_websocket() {
+    let headers = HeaderMap::new();
+    for tier in ["default", "auto", "fast", "priority", "ultrafast"] {
+        let body = json!({"model":"test-model","input":[],"service_tier":tier});
+        for kind in [RequestKind::Responses, RequestKind::Compact] {
+            let request = parse(&headers, body.clone(), kind).unwrap();
+            assert_eq!(request.requested_tier.as_deref(), Some(tier));
+        }
+        let mut body = body;
+        body["type"] = json!("response.create");
+        let request = parse_websocket(&headers, body, Uuid::new_v4()).unwrap();
+        assert_eq!(request.requested_tier.as_deref(), Some(tier));
+    }
+    for tier in [json!("unsupported"), json!(42)] {
+        let body = json!({"model":"test-model","input":[],"service_tier":tier});
+        assert!(ResponsesIngress.parse(&headers, body).is_err());
+    }
+}
+
 fn websocket_body(turn: Value) -> Value {
     json!({
         "type":"response.create", "model":"test-model", "input":[],

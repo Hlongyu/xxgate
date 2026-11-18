@@ -27,7 +27,11 @@ pub(crate) fn validate(r: &GatewayRequest, m: &ModelSpec) -> Result<()> {
             "This provider accepts Responses requests",
         ));
     }
-    if matches!(r.requested_tier.as_deref(), Some("fast" | "priority")) && !m.capabilities.fast {
+    if matches!(
+        r.requested_tier.as_deref(),
+        Some("fast" | "priority" | "ultrafast")
+    ) && !m.capabilities.fast
+    {
         return Err(Error::invalid("Fast mode is not enabled for this model"));
     }
     if r.document
@@ -524,6 +528,31 @@ mod memory_tests {
             vec![],
         );
         (a, c, m, ids)
+    }
+
+    #[test]
+    fn fast_tiers_require_model_capability_and_preserve_the_wire_value() {
+        let (a, c, mut m, mut ids) = fixture();
+        for tier in ["fast", "priority", "ultrafast"] {
+            let mut request = crate::ingress::ResponsesIngress
+                .parse(
+                    &HeaderMap::new(),
+                    json!({"model":"test","input":[],"service_tier":tier}),
+                )
+                .unwrap();
+            m.capabilities.fast = false;
+            assert!(validate(&request, &m).is_err());
+            m.capabilities.fast = true;
+            validate(&request, &m).unwrap();
+            let prepared = prepare(&request, &m, &a, &c, &mut ids).unwrap();
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(body["service_tier"], tier);
+            let prepared = prepare_consuming(&mut request, &m, &a, &c, &mut ids, 4096).unwrap();
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(body["service_tier"], tier);
+            m.capabilities.fast = false;
+            assert!(validate(&request, &m).is_err());
+        }
     }
 
     #[test]
