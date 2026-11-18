@@ -16,7 +16,7 @@ function harness(){
   CacheMetrics:require('../cache-metrics.js'),ErrorCenter:{page(){}},setInterval(fn,ms){timers.push({fn,ms});},setTimeout(){},clearTimeout(){},clearInterval(){},
   FormData:class{constructor(form){return Object.entries(form.values);}},fetch:()=>new Promise(()=>{})};
  vm.createContext(context);
- vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,billingFactor,usagePage,modelsPage,priceEdit,refreshCurrentPage,render};',context);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,billingFactor,billingTier,billingBasis,billingTooltip,usagePage,modelsPage,priceEdit,refreshCurrentPage,render};',context);
  context.fetch=async url=>{calls.push(url);return {ok:true,status:200,json:async()=>({items:[],total:calls.length})};};
  context.requestTest.state.auth=true;context.requestTest.state.page='requests';
  return {...context.requestTest,context,document,events,timers,calls,nodes,draft};
@@ -188,4 +188,27 @@ test('model prices expose two independent multipliers and save an unset Ultrafas
  form.values.ultrafast_multiplier='';
  await h.events.submit({target:form,preventDefault(){}});
  assert.equal(submitted[1].ultrafast_multiplier,null);
+});
+
+
+test('request based billing uses its frozen multiplier even when upstream reports default',()=>{
+ const h=harness();
+ const r={id:'requested',model:'model',key_id:'key',state:'completed',created_at:'2026-11-18T01:00:00Z',requested_tier:'ultrafast',
+  usage:{service_tier:'default'},price:{fast_multiplier:'2',ultrafast_multiplier:'7'},
+  valuation:{cny:'0.03',billing_tier:'ultrafast',billing_multiplier:'3',items:[{kind:'input',quantity:1000,cny:'0.03'}]}};
+ assert.equal(h.billingTier(r),'ultrafast');assert.equal(h.billingFactor(r),'3');
+ assert.match(h.requestRows([r]).join(''),/Ultrafast 计费倍率 3/);
+ assert.match(h.billingTooltip(r),/请求档位 · 计费档位 ultrafast/);
+ r.usage.service_tier=null;assert.equal(h.billingFactor(r),'3');
+ r.valuation={status:'unpriced_ultrafast',billing_tier:'ultrafast',billing_multiplier:null,cny:null,items:[]};
+ assert.equal(h.billingFactor(r),null,'do not borrow a current multiplier for a historically unpriced request');
+ assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
+ r.usage.service_tier='ultrafast';r.requested_tier='default';
+ r.valuation={billing_tier:'default',billing_multiplier:'1',cny:'0.01',items:[{kind:'input',quantity:1000,cny:'0.01'}]};
+ assert.equal(h.billingFactor(r),'1');assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
+ delete r.valuation.billing_tier;delete r.valuation.billing_multiplier;
+ r.requested_tier='ultrafast';r.usage.service_tier='default';
+ assert.equal(h.billingTier(r),'default');assert.equal(h.billingFactor(r),1);
+ assert.match(h.billingTooltip(r),/上游返回（历史规则）/);
+ assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/,'old default valuations must never become ultrafast after the policy changes');
 });

@@ -90,6 +90,10 @@ pub struct Valuation {
     pub price_version: Option<i64>,
     pub cny: Option<Decimal>,
     pub items: Vec<PriceLine>,
+    #[serde(default)]
+    pub billing_tier: Option<String>,
+    #[serde(default)]
+    pub billing_multiplier: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +131,8 @@ pub fn value_search(calls: u64, price: Option<&SearchPrice>) -> Valuation {
         price_version: None,
         cny: Some(Decimal::ZERO),
         items: vec![],
+        billing_tier: None,
+        billing_multiplier: None,
     };
     if calls == 0 {
         return value;
@@ -153,11 +159,14 @@ pub fn value_usage(
     requested_tier: Option<&str>,
     price: Option<&Price>,
 ) -> Valuation {
+    let billing_tier = requested_tier.unwrap_or("default");
     let mut result = Valuation {
         status: "usage_unknown".into(),
         price_version: price.map(|p| p.version),
         cny: None,
         items: vec![],
+        billing_tier: Some(billing_tier.into()),
+        billing_multiplier: None,
     };
     let Some(input) = usage.input_tokens else {
         return result;
@@ -188,14 +197,9 @@ pub fn value_usage(
         result.status = "unpriced".into();
         return result;
     };
-    let actual = usage.service_tier.as_deref();
-    if actual.is_none() && matches!(requested_tier, Some("fast" | "priority" | "ultrafast")) {
-        result.status = "tier_unknown".into();
-        return result;
-    }
     let tier_rates;
-    let rates = if matches!(actual, Some("fast" | "priority" | "ultrafast")) {
-        let ultrafast = actual == Some("ultrafast");
+    let rates = if matches!(billing_tier, "fast" | "priority" | "ultrafast") {
+        let ultrafast = billing_tier == "ultrafast";
         let multiplier = if ultrafast {
             price.ultrafast_multiplier
         } else {
@@ -211,9 +215,11 @@ pub fn value_usage(
             .into();
             return result;
         };
+        result.billing_multiplier = Some(factor);
         tier_rates = price.standard.multiplied(factor);
         &tier_rates
     } else {
+        result.billing_multiplier = Some(Decimal::ONE);
         &price.standard
     };
     let cached = match usage.cached_input_tokens {
@@ -397,7 +403,7 @@ mod tests {
         );
         assert_eq!(
             value_usage(&u, Some("fast"), Some(&price())).status,
-            "tier_unknown"
+            "priced"
         );
         assert!(
             value_usage(&Usage::default(), None, Some(&price()))
@@ -406,7 +412,7 @@ mod tests {
         );
     }
     #[test]
-    fn ultrafast_uses_confirmed_tier_and_its_independent_multiplier() {
+    fn requested_tier_controls_prices_even_when_upstream_disagrees_or_omits_tier() {
         let mut usage = Usage {
             input_tokens: Some(1000),
             cached_input_tokens: Some(500),
@@ -416,17 +422,24 @@ mod tests {
         };
         let mut p = price();
         let standard = value_usage(&usage, None, Some(&p)).cny.unwrap();
-        assert_eq!(
-            value_usage(&usage, Some("ultrafast"), Some(&p)).status,
-            "tier_unknown"
-        );
-        usage.service_tier = Some("ultrafast".into());
-        for requested in [None, Some("default"), Some("ultrafast")] {
-            assert_eq!(
-                value_usage(&usage, requested, Some(&p)).cny.unwrap(),
-                standard * Decimal::from(3)
-            );
+        for actual in [None, Some("default"), Some("priority"), Some("ultrafast")] {
+            usage.service_tier = actual.map(str::to_owned);
+            for (requested, tier, multiplier) in [
+                (None, "default", 1),
+                (Some("default"), "default", 1),
+                (Some("auto"), "auto", 1),
+                (Some("fast"), "fast", 2),
+                (Some("priority"), "priority", 2),
+                (Some("ultrafast"), "ultrafast", 3),
+            ] {
+                let value = value_usage(&usage, requested, Some(&p));
+                assert_eq!(value.cny.unwrap(), standard * Decimal::from(multiplier));
+                assert_eq!(value.billing_tier.as_deref(), Some(tier));
+                assert_eq!(value.billing_multiplier, Some(Decimal::from(multiplier)));
+                assert_eq!(usage.service_tier.as_deref(), actual);
+            }
         }
+        usage.service_tier = Some("default".into());
         p.fast_multiplier = None;
         assert_eq!(
             value_usage(&usage, Some("ultrafast"), Some(&p))
@@ -436,17 +449,19 @@ mod tests {
         );
         p.fast_multiplier = Some(Decimal::from(2));
         p.ultrafast_multiplier = None;
-        assert_eq!(
-            value_usage(&usage, Some("ultrafast"), Some(&p)).status,
-            "unpriced_ultrafast"
-        );
-        usage.service_tier = Some("default".into());
-        assert_eq!(
-            value_usage(&usage, Some("ultrafast"), Some(&p))
-                .cny
-                .unwrap(),
-            standard
-        );
+        let unpriced = value_usage(&usage, Some("ultrafast"), Some(&p));
+        assert_eq!(unpriced.status, "unpriced_ultrafast");
+        assert!(unpriced.cny.is_none() && unpriced.billing_multiplier.is_none());
+        assert_eq!(unpriced.billing_tier.as_deref(), Some("ultrafast"));
+    }
+
+    #[test]
+    fn legacy_valuations_keep_their_amount_without_inventing_a_billing_tier() {
+        let legacy =
+            serde_json::json!({"status":"priced","price_version":1,"cny":"0.0255","items":[]});
+        let value: Valuation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(value.cny, Some(Decimal::new(255, 4)));
+        assert!(value.billing_tier.is_none() && value.billing_multiplier.is_none());
     }
 
     #[test]
@@ -473,7 +488,10 @@ mod tests {
         }
         p.ultrafast_multiplier = Some(Decimal::from(7));
         p.fast_multiplier = Some(Decimal::from(5));
-        assert_ne!(value_usage(&usage, None, Some(&p)).cny, valuation.cny);
+        assert_ne!(
+            value_usage(&usage, Some("ultrafast"), Some(&p)).cny,
+            valuation.cny
+        );
         assert_eq!(
             valuation.cny.unwrap(),
             standard.cny.unwrap() * Decimal::from(3)
@@ -483,7 +501,7 @@ mod tests {
         usage.image_count = 0;
         usage.service_tier = Some("priority".into());
         assert_eq!(
-            value_usage(&usage, None, Some(&p)).cny.unwrap(),
+            value_usage(&usage, Some("priority"), Some(&p)).cny.unwrap(),
             Decimal::new(255, 4) * Decimal::from(5)
         );
     }

@@ -469,6 +469,7 @@ async fn upstream(
         let tier = body["service_tier"].as_str().unwrap_or("default");
         let mut completed = json!({"type":"response.completed","response":{"id":response_id,"object":"response","model":body["model"],"status":"completed","service_tier":tier,"output":[item],"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":400},"output_tokens":500,"output_tokens_details":{"reasoning_tokens":200},"total_tokens":1500}}});
         match behavior.as_str() {
+            "tier-default" => completed["response"]["service_tier"] = json!("default"),
             "model-route" => completed["response"]["model"] = json!("mock-routed-model"),
             "model-missing" | "model-created-only" => {
                 completed["response"]
@@ -1213,9 +1214,13 @@ async fn real_http_postgres_gateway_contract() {
 
     // Ultrafast must survive ingress, upstream forwarding, valuation and reports.
     let mut ultrafast_ids = Vec::new();
-    for stream in [false, true] {
+    for (behavior, stream, actual_tier) in [
+        ("normal", false, "ultrafast"),
+        ("tier-default", false, "default"),
+        ("tier-default", true, "default"),
+    ] {
         let response = c
-            .response("session-main", "normal", stream, "ultrafast")
+            .response("session-main", behavior, stream, "ultrafast")
             .await;
         assert_eq!(response.status(), 200);
         let request_id = response.headers()["x-request-id"]
@@ -1228,18 +1233,20 @@ async fn real_http_postgres_gateway_contract() {
                     .text()
                     .await
                     .unwrap()
-                    .contains("\"service_tier\":\"ultrafast\"")
+                    .contains(&format!("\"service_tier\":\"{actual_tier}\""))
             );
         } else {
             assert_eq!(
                 response.json::<Value>().await.unwrap()["service_tier"],
-                "ultrafast"
+                actual_tier
             );
         }
         let record = c.record(&request_id).await;
         ultrafast_ids.push(request_id);
         assert_eq!(record["request"]["requested_tier"], "ultrafast");
-        assert_eq!(record["request"]["usage"]["service_tier"], "ultrafast");
+        assert_eq!(record["request"]["usage"]["service_tier"], actual_tier);
+        assert_eq!(record["request"]["valuation"]["billing_tier"], "ultrafast");
+        assert_eq!(record["request"]["valuation"]["billing_multiplier"], "3");
         assert_eq!(
             record["request"]["valuation"]["cny"]
                 .as_str()
@@ -1760,7 +1767,7 @@ async fn real_http_postgres_gateway_contract() {
     let ultrafast = c
         .admin("/dashboard?service_tier=ultrafast", "GET", None)
         .await;
-    assert_eq!(ultrafast["summary"]["requests"], 2);
+    assert_eq!(ultrafast["summary"]["requests"], 1);
     let none = c
         .admin(
             &format!("/dashboard?key_id={}", Uuid::new_v4()),
@@ -2008,6 +2015,8 @@ async fn real_http_postgres_gateway_contract() {
         let listed = c.admin(&format!("/requests?id={id}"), "GET", None).await;
         let record = &listed["items"][0];
         assert_eq!(record["price"]["ultrafast_multiplier"], "3");
+        assert_eq!(record["valuation"]["billing_tier"], "ultrafast");
+        assert_eq!(record["valuation"]["billing_multiplier"], "3");
         assert_eq!(record["price"]["fast_multiplier"], "2");
         assert_eq!(
             record["valuation"]["cny"]

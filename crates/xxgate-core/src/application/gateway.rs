@@ -1130,6 +1130,8 @@ impl Gateway {
                 price_version: None,
                 cny: Some(rust_decimal::Decimal::ZERO),
                 items: vec![],
+                billing_tier: None,
+                billing_multiplier: None,
             }
         } else if e.record.kind == RequestKind::Search {
             crate::pricing::value_search(

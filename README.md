@@ -107,7 +107,7 @@ WS 失败后丢弃连接。原生 WS 请求、已经收到任何响应事件（�
 
 HTTP 自动增量状态仅保存于对应 WS 连接内存，包含临时响应 ID、项数和随机连接密钥的 HMAC 指纹；不保留历史正文或新增数据库内容存储。该完整历史匹配仍有线性计算成本，可关闭自动增量而继续使用 WS。原生 WS 不承担此匹配成本。传输增量与上游提示词缓存命中是独立机制，缓存率仍以上游 usage 为准。
 
-`service_tier` 支持 `default`、`auto`、`fast`、`priority` 和 `ultrafast`。`ultrafast` 原样转发到上游，沿用模型的 Fast 能力开关，使用独立的 `ultrafast_multiplier` 计价；费用以上游返回的实际档位为准。
+`service_tier` 支持 `default`、`auto`、`fast`、`priority` 和 `ultrafast`。`ultrafast` 原样转发到上游，沿用模型的 Fast 能力开关，使用独立的 `ultrafast_multiplier` 计价；费用按请求的 `service_tier` 选择倍率，上游返回档位仅作观测。未指定、`default` 和 `auto` 使用标准价格。
 
 ### 上下文压缩
 
@@ -115,7 +115,7 @@ HTTP 自动增量状态仅保存于对应 WS 连接内存，包含临时响应 I
 
 普通 Responses 同时支持 Remote V2：保留顶层 input 数组中的 `compaction_trigger`，以及 Codex turn metadata 的 request_kind / compaction 字段，并透传 SSE 中的 compaction 输出。按触发项，或 `request_kind=compaction` 且 `compaction.implementation=responses_compaction_v2` 识别本次 V2 操作；只有历史 `type=compaction` 或 Local 摘要标记时不标成 V2。
 
-点击请求详情可查看“上下文压缩”的方式、执行状态及是否已返回压缩项。压缩事实存于请求 JSON 中，不需要数据库迁移；列表继续仅返回渲染白名单，详情按需加载。Compact 的顶层 usage 复用输入、缓存、输出、推理 Token 及模型价格统计，保留数值用量扩展；返回的历史工具调用不重复计费。用量缺失时标为未知，Fast 实际档位缺失时不猜测倍率。压缩输入、输出、密文不进入持久记录。
+点击请求详情可查看“上下文压缩”的方式、执行状态及是否已返回压缩项。压缩事实存于请求 JSON 中，不需要数据库迁移；列表继续仅返回渲染白名单，详情按需加载。Compact 的顶层 usage 复用输入、缓存、输出、推理 Token 及模型价格统计，保留数值用量扩展；返回的历史工具调用不重复计费。用量缺失时标为未知；倍率依据请求档位，未配置对应倍率时标记未计价。压缩输入、输出、密文不进入持久记录。
 
 两种方式均复用鉴权、来源限制、分组、排队、账户绑定、身份映射、单次派发和取消机制。Compact 整体 JSON 返回使用 sse_idle_timeout_ms 作为派发后的读取期限，以 sse_event_limit_bytes 限制响应大小；已派发请求不会因新请求准入阈值而中断。客户端负责触发压缩并使用完整 output 替换上下文；网关不自动触发压缩。本轮不接入 API 的 context_management 自动压缩配置。
 
@@ -149,7 +149,7 @@ Search 使用 Codex 的独立 `alpha/search` JSON 协议，必需 `id` 和 `mode
 - 每次迁移创建新绑定代次，A→B→A 也不会复用旧代次的会话/线程等客户端身份 ID。绑定、映射和账户状态持久化，排队正文不落盘，重启不补发请求。
 - 队列、并发、内存、连接超时、SSE 空闲超时、排队心跳和保留期支持热更新。已有计时器以原开始时间重新计算。
 - 统计用量事实、官方额度和本地计价分别保存。人民币金额使用十进制定点数，分项保留 8 位小数；缓存 Token 从输入中拆分，推理 Token 不重复计入输出。
-- Fast/priority 采用标准价格乘以模型的 `fast_multiplier`（界面默认 2）；Ultrafast 使用独立的 `ultrafast_multiplier`，留空表示未设置，实际 Ultrafast 请求标记为未计价，不回退到 Fast 倍率。两种倍率均可设大于 0 至 100，输入、缓存、输出及图片计价项使用对应档位的同一倍率。采用上游确认的档位；请求 Fast 但实际档位缺失时标记未知。缺少用量、缓存细分或价格时不推定费用为零。
+- Fast/priority 采用标准价格乘以模型的 `fast_multiplier`（界面默认 2）；Ultrafast 使用独立的 `ultrafast_multiplier`，留空表示未设置，请求 Ultrafast 时标记为未计价，不回退到 Fast 倍率。两种倍率均可设大于 0 至 100，输入、缓存、输出及图片计价项使用对应档位的同一倍率。计费依据请求档位，返回 default 或缺少返回档位不改变请求倍率；未指定、default 和 auto 按标准价格。新请求冻结计费档位、倍率和价格版本，历史费用不重算。缺少用量、缓存细分或价格时不推定费用为零。
 - 凭证使用 ChaCha20-Poly1305 加密且绑定账户 ID；管理员密码使用 Argon2，Key 和会话令牌仅保存哈希。后台使用 HttpOnly/SameSite Cookie 与 CSRF 请求头。
 
 ## 上游模型与快速填价

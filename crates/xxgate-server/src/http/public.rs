@@ -138,6 +138,8 @@ async fn handle(state: AppState, request: Request, kind: RequestKind) -> Respons
                     price_version: None,
                     cny: Some(rust_decimal::Decimal::ZERO),
                     items: vec![],
+                    billing_tier: None,
+                    billing_multiplier: None,
                 }),
                 config_version: version,
                 config_versions: vec![version],
