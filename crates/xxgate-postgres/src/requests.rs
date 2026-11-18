@@ -232,7 +232,7 @@ fn request_report_query(summary: bool) -> String {
         "p.data->'usage'".into()
     };
     let price = if summary {
-        "jsonb_build_object('standard',data->'standard','fast_multiplier',data->'fast_multiplier')"
+        "jsonb_build_object('standard',data->'standard','fast_multiplier',data->'fast_multiplier','ultrafast_multiplier',data->'ultrafast_multiplier')"
     } else {
         "data"
     };

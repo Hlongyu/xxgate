@@ -540,6 +540,8 @@ pub struct PriceInput {
     model: xxgate_core::types::ModelRef,
     standard: xxgate_core::pricing::Rates,
     fast_multiplier: rust_decimal::Decimal,
+    #[serde(default)]
+    ultrafast_multiplier: Option<rust_decimal::Decimal>,
 }
 pub async fn save_price(
     State(s): State<AppState>,
@@ -563,6 +565,7 @@ pub async fn save_price(
                 model: input.model,
                 standard: input.standard,
                 fast_multiplier: Some(input.fast_multiplier),
+                ultrafast_multiplier: input.ultrafast_multiplier,
             })
             .await?,
     ))

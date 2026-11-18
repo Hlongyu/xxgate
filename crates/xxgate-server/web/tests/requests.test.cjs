@@ -7,8 +7,8 @@ process.env.TZ='Asia/Shanghai';
 
 function harness(){
  const events={},timers=[],calls=[],nodes=new Map();
- function node(){return {innerHTML:'',textContent:'',open:false,querySelector(){return null;},addEventListener(){},remove(){},classList:{add(){},remove(){}}};}
- for(const id of ['#app','#dialog','#main','#breadcrumb','#updated','#request-refresh-status','#request-results','#toast'])nodes.set(id,node());
+ function node(){return {innerHTML:'',textContent:'',open:false,showModal(){this.open=true;},close(){this.open=false;},replaceChildren(){this.innerHTML='';},querySelector(){return null;},addEventListener(){},remove(){},classList:{add(){},remove(){}}};}
+ for(const id of ['#app','#dialog','#dialog-content','#main','#breadcrumb','#updated','#request-refresh-status','#request-results','#toast'])nodes.set(id,node());
  const draft={value:'正在输入的新条件'};
  const document={hidden:false,querySelector(selector){return nodes.get(selector)||(selector.includes(':focus')?draft:null);},addEventListener(name,fn){events[name]=fn;},
   createElement(){return {innerHTML:'',get content(){const html=this.innerHTML;return {querySelector(){const marker='<div id="request-results">';return {innerHTML:html.slice(html.indexOf(marker)+marker.length,-12)};}};}};}};
@@ -16,7 +16,7 @@ function harness(){
   CacheMetrics:require('../cache-metrics.js'),ErrorCenter:{page(){}},setInterval(fn,ms){timers.push({fn,ms});},setTimeout(){},clearTimeout(){},clearInterval(){},
   FormData:class{constructor(form){return Object.entries(form.values);}},fetch:()=>new Promise(()=>{})};
  vm.createContext(context);
- vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,billingFactor,usagePage,refreshCurrentPage,render};',context);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../app.js'),'utf8')+'\nglobalThis.requestTest={state,requestFilter,requestLocalTime,requestTodayFilter,requestTransport,requestRows,billingFactor,usagePage,modelsPage,priceEdit,refreshCurrentPage,render};',context);
  context.fetch=async url=>{calls.push(url);return {ok:true,status:200,json:async()=>({items:[],total:calls.length})};};
  context.requestTest.state.auth=true;context.requestTest.state.page='requests';
  return {...context.requestTest,context,document,events,timers,calls,nodes,draft};
@@ -130,10 +130,15 @@ test('request transport reflects the recorded upstream path, not streaming or cu
 });
 
 
-test('ultrafast uses the historical Fast multiplier and actual tier in request rows',()=>{
+test('ultrafast uses its independent multiplier and preserves already priced legacy rows',()=>{
  const h=harness();
  const r={id:'request',key_id:'key',model:'test-model',kind:'responses',state:'completed',created_at:'2026-11-05T06:00:00Z',upstream_attempts:1,
   requested_tier:'ultrafast',usage:{service_tier:'ultrafast'},price:{fast_multiplier:'2.5'},valuation:{cny:'0.025',items:[{kind:'input',quantity:1000,cny:'0.025'}]}};
+ r.price.ultrafast_multiplier='3';
+ assert.equal(h.billingFactor(r),'3');
+ assert.match(h.requestRows([r]).join(''),/Ultrafast 计费倍率 3/);
+ r.usage.service_tier='priority';assert.equal(h.billingFactor(r),'2.5');
+ r.usage.service_tier='ultrafast';delete r.price.ultrafast_multiplier;
  assert.equal(h.billingFactor(r),'2.5');
  assert.match(h.requestRows([r]).join(''),/class="fast-badge"[^>]*>×2.5/);
  r.usage.service_tier=null;
@@ -142,7 +147,10 @@ test('ultrafast uses the historical Fast multiplier and actual tier in request r
  r.usage.service_tier='default';
  assert.equal(h.billingFactor(r),1);
  assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
- r.usage.service_tier='ultrafast';r.price.fast_multiplier=null;
+ r.usage.service_tier='ultrafast';r.valuation={status:'unpriced_ultrafast',cny:null,items:[]};
+ assert.equal(h.billingFactor(r),null,'unset independent multiplier must not borrow Fast for new requests');
+ assert.doesNotMatch(h.requestRows([r]).join(''),/class="fast-badge"/);
+ r.price.fast_multiplier=null;
  assert.equal(h.billingFactor(r),null);
 });
 
@@ -152,4 +160,32 @@ test('usage page can select and query the ultrafast tier',async()=>{
  const html=await h.usagePage(async url=>{calls.push(url);return url.startsWith('/dashboard?')?{summary:{},models:[]}:{items:[]};});
  assert.equal(calls[0],'/dashboard?service_tier=ultrafast');
  assert.match(html,/<option value="ultrafast" selected>ultrafast<\/option>/);
+});
+
+
+test('model prices expose two independent multipliers and save an unset Ultrafast price as null',async()=>{
+ const h=harness(),upstream={provider:'openai',access_kind:'codex_oauth',model:'test-model'};
+ const model={id:'test-model',enabled:true,upstream},price={model:upstream,standard:{input_per_million:'10',cached_input_per_million:'1',output_per_million:'20'},fast_multiplier:'2',ultrafast_multiplier:'3'};
+ const html=await h.modelsPage(async url=>({'/models':{items:[model]},'/prices':{items:[price]},'/models/discovered':{items:[],accounts:[]},'/models/sync':{running:false},'/search-price':{per_call:null}}[url]));
+ assert.match(html,/Fast \/ Priority 倍率/);assert.match(html,/Ultrafast 倍率/);
+ assert.match(html,/× 2/);assert.match(html,/× 3/);
+ h.priceEdit(model.id);
+ let dialog=h.nodes.get('#dialog-content').innerHTML;
+ assert.match(dialog,/<input name="fast_multiplier"[^>]*value="2"/);
+ assert.match(dialog,/<input name="ultrafast_multiplier"[^>]*value="3"/);
+ assert.match(dialog,/留空表示未设置/);
+ delete price.ultrafast_multiplier;h.priceEdit(model.id);
+ dialog=h.nodes.get('#dialog-content').innerHTML;
+ assert.match(dialog,/<input name="ultrafast_multiplier"[^>]*value=""/);
+ const submitted=[];
+ h.context.fetch=async(url,options)=>{
+  if(url==='/api/admin/prices')submitted.push(JSON.parse(options.body));
+  return {ok:true,status:200,json:async()=>({items:[],total:0})};
+ };
+ const form={dataset:{form:'price',id:model.id},values:{...price.standard,fast_multiplier:'2',ultrafast_multiplier:'4.5'},querySelector(){return null;}};
+ await h.events.submit({target:form,preventDefault(){}});
+ assert.equal(submitted[0].fast_multiplier,'2');assert.equal(submitted[0].ultrafast_multiplier,'4.5');
+ form.values.ultrafast_multiplier='';
+ await h.events.submit({target:form,preventDefault(){}});
+ assert.equal(submitted[1].ultrafast_multiplier,null);
 });

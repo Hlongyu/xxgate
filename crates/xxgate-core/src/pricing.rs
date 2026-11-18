@@ -62,6 +62,8 @@ pub struct Price {
     pub standard: Rates,
     #[serde(default)]
     pub fast_multiplier: Option<Decimal>,
+    #[serde(default)]
+    pub ultrafast_multiplier: Option<Decimal>,
 }
 impl Price {
     pub fn validate(&self) -> Result<()> {
@@ -71,6 +73,12 @@ impl Price {
             .is_some_and(|v| v > Decimal::ZERO && v <= Decimal::from(100))
         {
             return Err(Error::invalid("Fast 倍率必须大于 0 且不超过 100。"));
+        }
+        if self
+            .ultrafast_multiplier
+            .is_some_and(|v| v <= Decimal::ZERO || v > Decimal::from(100))
+        {
+            return Err(Error::invalid("Ultrafast 倍率必须大于 0 且不超过 100。"));
         }
         Ok(())
     }
@@ -185,17 +193,26 @@ pub fn value_usage(
         result.status = "tier_unknown".into();
         return result;
     }
-    let fast_rates;
+    let tier_rates;
     let rates = if matches!(actual, Some("fast" | "priority" | "ultrafast")) {
-        let Some(factor) = price
-            .fast_multiplier
-            .filter(|v| *v > Decimal::ZERO && *v <= Decimal::from(100))
+        let ultrafast = actual == Some("ultrafast");
+        let multiplier = if ultrafast {
+            price.ultrafast_multiplier
+        } else {
+            price.fast_multiplier
+        };
+        let Some(factor) = multiplier.filter(|v| *v > Decimal::ZERO && *v <= Decimal::from(100))
         else {
-            result.status = "unpriced_fast".into();
+            result.status = if ultrafast {
+                "unpriced_ultrafast"
+            } else {
+                "unpriced_fast"
+            }
+            .into();
             return result;
         };
-        fast_rates = price.standard.multiplied(factor);
-        &fast_rates
+        tier_rates = price.standard.multiplied(factor);
+        &tier_rates
     } else {
         &price.standard
     };
@@ -361,6 +378,7 @@ mod tests {
                 per_image: None,
             },
             fast_multiplier: Some(Decimal::from(2)),
+            ultrafast_multiplier: Some(Decimal::from(3)),
         }
     }
     #[test]
@@ -388,7 +406,7 @@ mod tests {
         );
     }
     #[test]
-    fn ultrafast_uses_confirmed_tier_and_the_fast_multiplier() {
+    fn ultrafast_uses_confirmed_tier_and_its_independent_multiplier() {
         let mut usage = Usage {
             input_tokens: Some(1000),
             cached_input_tokens: Some(500),
@@ -406,13 +424,21 @@ mod tests {
         for requested in [None, Some("default"), Some("ultrafast")] {
             assert_eq!(
                 value_usage(&usage, requested, Some(&p)).cny.unwrap(),
-                standard * Decimal::from(2)
+                standard * Decimal::from(3)
             );
         }
         p.fast_multiplier = None;
         assert_eq!(
+            value_usage(&usage, Some("ultrafast"), Some(&p))
+                .cny
+                .unwrap(),
+            standard * Decimal::from(3)
+        );
+        p.fast_multiplier = Some(Decimal::from(2));
+        p.ultrafast_multiplier = None;
+        assert_eq!(
             value_usage(&usage, Some("ultrafast"), Some(&p)).status,
-            "unpriced_fast"
+            "unpriced_ultrafast"
         );
         usage.service_tier = Some("default".into());
         assert_eq!(
@@ -420,6 +446,45 @@ mod tests {
                 .cny
                 .unwrap(),
             standard
+        );
+    }
+
+    #[test]
+    fn ultrafast_multiplies_every_rate_and_keeps_the_valuation_frozen() {
+        let mut p = price();
+        p.standard.per_image = Some(Decimal::new(15, 1));
+        let mut usage = Usage {
+            input_tokens: Some(1000),
+            cached_input_tokens: Some(500),
+            output_tokens: Some(1000),
+            image_count: 2,
+            complete: true,
+            ..Default::default()
+        };
+        let standard = value_usage(&usage, None, Some(&p));
+        usage.service_tier = Some("ultrafast".into());
+        let valuation = value_usage(&usage, Some("ultrafast"), Some(&p));
+        assert_eq!(
+            valuation.cny.unwrap(),
+            standard.cny.unwrap() * Decimal::from(3)
+        );
+        for (line, base) in valuation.items.iter().zip(&standard.items) {
+            assert_eq!(line.rate, base.rate * Decimal::from(3));
+        }
+        p.ultrafast_multiplier = Some(Decimal::from(7));
+        p.fast_multiplier = Some(Decimal::from(5));
+        assert_ne!(value_usage(&usage, None, Some(&p)).cny, valuation.cny);
+        assert_eq!(
+            valuation.cny.unwrap(),
+            standard.cny.unwrap() * Decimal::from(3)
+        );
+        p.ultrafast_multiplier = None;
+        p.standard.per_image = None;
+        usage.image_count = 0;
+        usage.service_tier = Some("priority".into());
+        assert_eq!(
+            value_usage(&usage, None, Some(&p)).cny.unwrap(),
+            Decimal::new(255, 4) * Decimal::from(5)
         );
     }
 
@@ -461,7 +526,29 @@ mod tests {
         for multiplier in [Decimal::ZERO, Decimal::NEGATIVE_ONE, Decimal::from(101)] {
             p.fast_multiplier = Some(multiplier);
             assert!(p.validate().is_err());
+            let mut p = price();
+            p.ultrafast_multiplier = Some(multiplier);
+            assert!(p.validate().is_err());
         }
+        let mut old = serde_json::to_value(price()).unwrap();
+        old.as_object_mut().unwrap().remove("ultrafast_multiplier");
+        let old: Price = serde_json::from_value(old).unwrap();
+        assert_eq!(old.ultrafast_multiplier, None);
+        old.validate().unwrap();
+        assert_eq!(
+            value_usage(
+                &Usage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    service_tier: Some("ultrafast".into()),
+                    ..Default::default()
+                },
+                Some("ultrafast"),
+                Some(&old)
+            )
+            .status,
+            "unpriced_ultrafast"
+        );
         let mut legacy = serde_json::to_value(price()).unwrap();
         legacy.as_object_mut().unwrap().remove("fast_multiplier");
         legacy["fast"] = serde_json::to_value(price().standard).unwrap();

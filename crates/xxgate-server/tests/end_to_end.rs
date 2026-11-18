@@ -928,7 +928,20 @@ async fn real_http_postgres_gateway_contract() {
         .to_owned();
     c.admin("/models","PUT",Some(json!({"id":"mock-model","upstream":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"enabled":true,"capabilities":{},"version":0}))).await;
     let rates = json!({"input_per_million":"10","cached_input_per_million":"1","output_per_million":"20","image_input_per_million":null,"image_output_per_million":null,"per_image":"1.5"});
-    c.admin("/prices","PUT",Some(json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":rates,"fast_multiplier":"2"}))).await;
+    c.admin("/prices","PUT",Some(json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":rates,"fast_multiplier":"2","ultrafast_multiplier":"3"}))).await;
+    for (invalid, status) in [
+        (json!("0"), 400),
+        (json!("-1"), 400),
+        (json!("101"), 400),
+        (json!("invalid"), 422),
+    ] {
+        let response = c.http.put(format!("{}/api/admin/prices", c.base))
+            .header("x-xxgate-csrf", "1")
+            .json(&json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":rates,"fast_multiplier":"2","ultrafast_multiplier":invalid}))
+            .send().await.unwrap();
+        assert_eq!(response.status().as_u16(), status);
+    }
+
     let mut account_ids = vec![];
     for name in ["A", "B"] {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1199,6 +1212,7 @@ async fn real_http_postgres_gateway_contract() {
     );
 
     // Ultrafast must survive ingress, upstream forwarding, valuation and reports.
+    let mut ultrafast_ids = Vec::new();
     for stream in [false, true] {
         let response = c
             .response("session-main", "normal", stream, "ultrafast")
@@ -1223,11 +1237,16 @@ async fn real_http_postgres_gateway_contract() {
             );
         }
         let record = c.record(&request_id).await;
+        ultrafast_ids.push(request_id);
         assert_eq!(record["request"]["requested_tier"], "ultrafast");
         assert_eq!(record["request"]["usage"]["service_tier"], "ultrafast");
         assert_eq!(
-            record["request"]["valuation"]["cny"],
-            c.record(&unary_id).await["request"]["valuation"]["cny"]
+            record["request"]["valuation"]["cny"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            0.0492
         );
         assert_eq!(
             mock.captures.lock().await.last().unwrap().1["service_tier"],
@@ -1973,7 +1992,7 @@ async fn real_http_postgres_gateway_contract() {
         forwarded_capture.1["input"][5]["call_id"]
     );
     // List presentation uses the request's historical price, not today's rates.
-    c.admin("/prices", "PUT", Some(json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":{"input_per_million":"99","cached_input_per_million":"9","output_per_million":"199","image_input_per_million":null,"image_output_per_million":null,"per_image":"3"},"fast_multiplier":"5"}))).await;
+    c.admin("/prices", "PUT", Some(json!({"version":0,"model":{"provider":"openai","access_kind":"codex_oauth","model":"mock-upstream"},"standard":{"input_per_million":"99","cached_input_per_million":"9","output_per_million":"199","image_input_per_million":null,"image_output_per_million":null,"per_image":"3"},"fast_multiplier":"5","ultrafast_multiplier":"7"}))).await;
     let listed = c
         .admin(&format!("/requests?id={unary_id}"), "GET", None)
         .await;
@@ -1985,6 +2004,20 @@ async fn real_http_postgres_gateway_contract() {
     assert_eq!(listed["price"]["standard"]["cached_input_per_million"], "1");
     assert_eq!(listed["price"]["fast_multiplier"], "2");
     assert_eq!(listed["valuation"]["cny"], "0.0328");
+    for id in ultrafast_ids {
+        let listed = c.admin(&format!("/requests?id={id}"), "GET", None).await;
+        let record = &listed["items"][0];
+        assert_eq!(record["price"]["ultrafast_multiplier"], "3");
+        assert_eq!(record["price"]["fast_multiplier"], "2");
+        assert_eq!(
+            record["valuation"]["cny"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap(),
+            0.0492
+        );
+    }
     assert!(listed.get("ingress_diagnostics").is_none());
     assert!(listed["usage"].get("raw_usage").is_none());
     // Both admin JSON and embedded assets negotiate compression. Public SSE
