@@ -341,3 +341,13 @@ Codex `rust-v0.166.0-alpha.6` 的启动预热使用空 `INITIAL_SUBMIT_ID`，在
 2026-11-18 08:51（Asia/Shanghai）完成 worker 交接和稳定入口切换，36 次就绪探测全部成功。当前 project 为 `xxgate-ultrafast-12c52c7`，入口 ID 为 `entry-ultrafast-12c52c7`；公网、内部稳定入口及 Docker `xxgate:8787` 返回同一 boot ID。`/opt/xxgate/current` 指向 `/opt/xxgate/releases/20261118-ultrafast-12c52c7`，运行配置为 `release.env` 和 `ingress.env`（0600）。旧绿色进程关闭自动重启，保留用于已有连接自然排空。
 
 公网 `gpt-5.6-sol` 的 ultrafast SSE 和原生 WebSocket 生成均成功，分别约 1.90 秒和 1.30 秒。两次上游实际档位均为 `default`，请求记录按实际标准价计费，不据此宣称上游启用了超快档位。临时验证 Key 已删除，管理员验证会话已退出。
+
+## 2026-11-18 Ultrafast 独立倍率补充上线
+
+提交 `b0b047d` 增加独立的 `ultrafast_multiplier`；「模型与价格」列表和修改价格表单分别提供 Fast / Priority 与 Ultrafast 倍率。Ultrafast 留空表示未设置，实际 ultrafast 新请求标记 `unpriced_ultrafast`，不回退到 Fast 倍率。沿用按实际档位计费、历史价格版本和已记录金额；旧版已计价的 ultrafast 请求仍显示其原 Fast 倍率。价格 JSON 兼容旧记录，无数据库迁移，未自动修改现有模型价格。
+
+153 项 Rust 回归通过（跳过前轮已记录的 WebSocket 相关测试组，共 16 项），30 项前端测试、Clippy、fmt 和 diff 检查通过。Linux amd64 成品另通过证书和隔离集群的 9 次请求验证：Fast 2 倍、Ultrafast 3 倍独立计价，未配置时未计价，更新为 7 倍后历史仍为 3 倍，双 worker、交接和 Nginx 入口正常。
+
+发布镜像 `local/xxgate:20261118-ultrafast-pricing-b0b047d` 在本机构建，Docker archive SHA-256 为 `a1539092cfae9e76e4fbab48b423014f04cb208bc9e97c06653b262720587519`。生产仅校验、加载、预检及 `--no-build --pull never` 启动，按用户要求没有备份。2026-11-18 09:10（Asia/Shanghai）完成交接和切流，185 次就绪探测无失败；保留 schema 21、原数据卷、6 个账户、5 个有效 Key、原 Key 哈希和凭证。旧转发链保留以服务已有连接。
+
+当前 project 为 `xxgate-ultrafast-pricing-b0b047d`，`/opt/xxgate/current` 指向 `/opt/xxgate/releases/20261118-ultrafast-pricing-b0b047d`，使用 `release.env`、`ingress.env`。线上价格接口和页面已提供新字段，验证前后现有价格一致；公网 SSE 和原生 WebSocket 请求通过，上游实际档位仍为 default。临时验证 Key 已删除，管理员验证会话已退出。
